@@ -1,0 +1,6 @@
+# LipNet Training Pipeline - Dependencies
+tensorflow>=2.15.0
+mediapipe>=0.10.9
+opencv-python>=4.9.0
+numpy>=1.24.0
+matplotlib>=3.8.0

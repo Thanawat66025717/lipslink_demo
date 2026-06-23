@@ -515,20 +515,29 @@ class _ScannerScreenState extends State<ScannerScreen>
     );
   }
 
+  void _simulateMouthOpen(bool isOpen) {
+    if (!mounted) return;
+    _updateMouthState(isOpen ? 1.0 : 0.0, faceDetected: true);
+  }
+
   Widget _buildCameraCard() {
-    return Container(
-      height: 340,
-      decoration: BoxDecoration(
-        color: Colors.black,
-        borderRadius: BorderRadius.circular(24),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.1),
-            blurRadius: 15, offset: const Offset(0, 5),
-          ),
-        ],
-      ),
-      clipBehavior: Clip.antiAlias,
+    return GestureDetector(
+      onTapDown: (_) => _simulateMouthOpen(true),
+      onTapUp: (_) => _simulateMouthOpen(false),
+      onTapCancel: () => _simulateMouthOpen(false),
+      child: Container(
+        height: 340,
+        decoration: BoxDecoration(
+          color: Colors.black,
+          borderRadius: BorderRadius.circular(24),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.1),
+              blurRadius: 15, offset: const Offset(0, 5),
+            ),
+          ],
+        ),
+        clipBehavior: Clip.antiAlias,
       child: Stack(
         fit: StackFit.expand,
         children: [
