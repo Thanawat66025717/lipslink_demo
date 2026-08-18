@@ -13,7 +13,7 @@ class AppTheme {
 
   static const Color background = Color(0xFFF3FAFF);
   static const Color surface = Color(0xFFFFFFFF);
-  
+
   static const Color textPrimary = Color(0xFF333333);
   static const Color textSecondary = Color(0xFF666666);
   static const Color textHint = Color(0xFFAAAAAA);
@@ -23,13 +23,16 @@ class AppTheme {
 
   // Gradients
   static const LinearGradient primaryGradient = LinearGradient(
-    colors: [Color(0xFF6FB9F6), Color(0xFF6FB9F6)], // Solid color basically, or slight gradient
+    colors: [
+      Color(0xFF6FB9F6),
+      Color(0xFF6FB9F6)
+    ], // Solid color basically, or slight gradient
     begin: Alignment.topLeft,
     end: Alignment.bottomRight,
   );
-  
+
   static const LinearGradient successGradient = LinearGradient(
-    colors: [Color(0xFF7DCE9E), Color(0xFF7DCE9E)], 
+    colors: [Color(0xFF7DCE9E), Color(0xFF7DCE9E)],
     begin: Alignment.topLeft,
     end: Alignment.bottomRight,
   );

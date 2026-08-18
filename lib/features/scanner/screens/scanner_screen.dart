@@ -7,6 +7,7 @@ import 'package:flutter_animate/flutter_animate.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:uuid/uuid.dart';
+import 'package:flutter/foundation.dart';
 import '../../../app/theme/app_theme.dart';
 import '../../../shared/models/phrase_model.dart';
 import '../../../shared/services/tts_service.dart';
@@ -37,7 +38,7 @@ class _ScannerScreenState extends State<ScannerScreen>
   // ─── ML Kit ───────────────────────────────────────────────────────────────
   final FaceDetector _faceDetector = FaceDetector(
     options: FaceDetectorOptions(
-      enableClassification: true,   // gives mouthOpenProbability
+      enableClassification: true, // gives mouthOpenProbability
       enableLandmarks: true,
       performanceMode: FaceDetectorMode.fast,
     ),
@@ -53,8 +54,8 @@ class _ScannerScreenState extends State<ScannerScreen>
   // ─── Speaking state machine ────────────────────────────────────────────────
   // States: idle → listening → speaking → paused → finalizing
   _SpeakingState _state = _SpeakingState.idle;
-  Timer? _silenceTimer;      // fires when mouth closed long enough → finalize
-  Timer? _wordTimer;         // fires to emit next simulated word
+  Timer? _silenceTimer; // fires when mouth closed long enough → finalize
+  Timer? _wordTimer; // fires to emit next simulated word
   Duration _silenceGap = const Duration(milliseconds: 800);
   int _consecutiveSilenceFrames = 0;
   int _consecutiveSpeakFrames = 0;
@@ -87,9 +88,21 @@ class _ScannerScreenState extends State<ScannerScreen>
   ];
 
   static const List<String> _emotionPool = [
-    'happy', 'neutral', 'neutral', 'sad', 'neutral',
-    'neutral', 'happy', 'sad', 'neutral', 'neutral',
-    'neutral', 'happy', 'sad', 'neutral', 'sad',
+    'happy',
+    'neutral',
+    'neutral',
+    'sad',
+    'neutral',
+    'neutral',
+    'happy',
+    'sad',
+    'neutral',
+    'neutral',
+    'neutral',
+    'happy',
+    'sad',
+    'neutral',
+    'sad',
   ];
 
   List<String> _currentWordList = [];
@@ -133,7 +146,9 @@ class _ScannerScreenState extends State<ScannerScreen>
     try {
       _cameras = await availableCameras();
       if (_cameras.isEmpty) return;
-      await _startCamera(_isFrontCamera ? 1 : 0);
+      await _startCamera(
+        _cameras.length > 1 && _isFrontCamera ? 1 : 0,
+      );
     } catch (e) {
       debugPrint('Camera init error: $e');
     }
@@ -159,7 +174,9 @@ class _ScannerScreenState extends State<ScannerScreen>
     _cameraController = controller;
 
     // Start image stream for real-time processing
-    await controller.startImageStream(_onCameraFrame);
+    if (!kIsWeb) {
+      await controller.startImageStream(_onCameraFrame);
+    }
 
     setState(() {
       _cameraReady = true;
@@ -218,9 +235,9 @@ class _ScannerScreenState extends State<ScannerScreen>
       }
       final bytes = allBytes.done().buffer.asUint8List();
 
-      final rotation = InputImageRotationValue.fromRawValue(
-            camera.sensorOrientation) ??
-          InputImageRotation.rotation0deg;
+      final rotation =
+          InputImageRotationValue.fromRawValue(camera.sensorOrientation) ??
+              InputImageRotation.rotation0deg;
 
       final format = InputImageFormatValue.fromRawValue(image.format.raw);
       if (format == null) return null;
@@ -414,7 +431,8 @@ class _ScannerScreenState extends State<ScannerScreen>
           ]),
           backgroundColor: AppTheme.success,
           behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           margin: const EdgeInsets.all(16),
           duration: const Duration(seconds: 2),
         ),
@@ -449,29 +467,42 @@ class _ScannerScreenState extends State<ScannerScreen>
   // ─── UI helpers ───────────────────────────────────────────────────────────
   Color get _emotionColor {
     switch (_currentEmotion) {
-      case 'happy': return const Color(0xFF4CAF50);
-      case 'sad':   return const Color(0xFF2196F3);
-      case 'angry': return const Color(0xFFEF5350);
-      default:      return AppTheme.textSecondary;
+      case 'happy':
+        return const Color(0xFF4CAF50);
+      case 'sad':
+        return const Color(0xFF2196F3);
+      case 'angry':
+        return const Color(0xFFEF5350);
+      default:
+        return AppTheme.textSecondary;
     }
   }
 
   String get _emotionLabel {
     switch (_currentEmotion) {
-      case 'happy': return '😊 มีความสุข';
-      case 'sad':   return '😢 เศร้า';
-      case 'angry': return '😠 โกรธ';
-      default:      return '😐 ปกติ';
+      case 'happy':
+        return '😊 มีความสุข';
+      case 'sad':
+        return '😢 เศร้า';
+      case 'angry':
+        return '😠 โกรธ';
+      default:
+        return '😐 ปกติ';
     }
   }
 
   String get _stateLabel {
     switch (_state) {
-      case _SpeakingState.idle:       return 'รอตรวจจับ...';
-      case _SpeakingState.speaking:   return '🎙 กำลังวิเคราะห์...';
-      case _SpeakingState.paused:     return '⏸ หยุดชั่วคราว';
-      case _SpeakingState.finalizing: return '✅ วิเคราะห์เสร็จแล้ว';
-      default:                        return '';
+      case _SpeakingState.idle:
+        return 'รอตรวจจับ...';
+      case _SpeakingState.speaking:
+        return '🎙 กำลังวิเคราะห์...';
+      case _SpeakingState.paused:
+        return '⏸ หยุดชั่วคราว';
+      case _SpeakingState.finalizing:
+        return '✅ วิเคราะห์เสร็จแล้ว';
+      default:
+        return '';
     }
   }
 
@@ -496,7 +527,8 @@ class _ScannerScreenState extends State<ScannerScreen>
               const SizedBox(height: 16),
               Expanded(
                 child: SingleChildScrollView(
-                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
                   child: Column(
                     children: [
                       _buildCameraCard(),
@@ -533,32 +565,41 @@ class _ScannerScreenState extends State<ScannerScreen>
           boxShadow: [
             BoxShadow(
               color: Colors.black.withOpacity(0.1),
-              blurRadius: 15, offset: const Offset(0, 5),
+              blurRadius: 15,
+              offset: const Offset(0, 5),
             ),
           ],
         ),
         clipBehavior: Clip.antiAlias,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          // Camera preview or placeholder
-          _cameraReady && _cameraController != null
-              ? CameraPreview(_cameraController!)
-              : Container(
-                  color: const Color(0xFF0D1B2A),
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Icon(Icons.camera_alt_outlined, color: Colors.white38, size: 52),
-                      const SizedBox(height: 12),
-                      const Text('กำลังเปิดกล้อง...', style: TextStyle(color: Colors.white54)),
-                    ],
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            // Camera preview or placeholder
+            _cameraReady && _cameraController != null
+                ? CameraPreview(_cameraController!)
+                : Container(
+                    color: const Color(0xFF0D1B2A),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(
+                          Icons.camera_alt_outlined,
+                          color: Colors.white38,
+                          size: 52,
+                        ),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'กำลังเปิดกล้อง...',
+                          style: TextStyle(color: Colors.white54),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
 
-          // Face detection frame (Green corners)
-          if (_cameraReady) _buildFaceFrame(),
-        ],
+            // Face detection frame (Green corners)
+            if (_cameraReady) _buildFaceFrame(),
+          ],
+        ),
       ),
     );
   }
@@ -574,7 +615,9 @@ class _ScannerScreenState extends State<ScannerScreen>
             height: 220,
             decoration: BoxDecoration(
               border: Border.all(
-                color: isActive ? AppTheme.success : AppTheme.success.withOpacity(0.5),
+                color: isActive
+                    ? AppTheme.success
+                    : AppTheme.success.withOpacity(0.5),
                 width: 2,
               ),
             ),
@@ -583,13 +626,23 @@ class _ScannerScreenState extends State<ScannerScreen>
         // Draw corners
         Center(
           child: SizedBox(
-            width: 220, height: 220,
+            width: 220,
+            height: 220,
             child: Stack(
               children: [
                 Positioned(top: -2, left: -2, child: _buildCorner()),
-                Positioned(top: -2, right: -2, child: RotatedBox(quarterTurns: 1, child: _buildCorner())),
-                Positioned(bottom: -2, right: -2, child: RotatedBox(quarterTurns: 2, child: _buildCorner())),
-                Positioned(bottom: -2, left: -2, child: RotatedBox(quarterTurns: 3, child: _buildCorner())),
+                Positioned(
+                    top: -2,
+                    right: -2,
+                    child: RotatedBox(quarterTurns: 1, child: _buildCorner())),
+                Positioned(
+                    bottom: -2,
+                    right: -2,
+                    child: RotatedBox(quarterTurns: 2, child: _buildCorner())),
+                Positioned(
+                    bottom: -2,
+                    left: -2,
+                    child: RotatedBox(quarterTurns: 3, child: _buildCorner())),
               ],
             ),
           ),
@@ -599,7 +652,8 @@ class _ScannerScreenState extends State<ScannerScreen>
           child: Padding(
             padding: const EdgeInsets.only(top: 80), // push down to mouth area
             child: Container(
-              width: 80, height: 40,
+              width: 80,
+              height: 40,
               decoration: BoxDecoration(
                 border: Border.all(
                   color: AppTheme.success.withOpacity(isActive ? 0.8 : 0.3),
@@ -634,14 +688,18 @@ class _ScannerScreenState extends State<ScannerScreen>
         boxShadow: [
           BoxShadow(
             color: Colors.black.withOpacity(0.04),
-            blurRadius: 10, offset: const Offset(0, 4),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
           ),
         ],
       ),
       child: hasText
           ? Text(
               _displayText + (_state == _SpeakingState.speaking ? '...' : ''),
-              style: const TextStyle(fontSize: 16, color: AppTheme.textPrimary, fontWeight: FontWeight.w500),
+              style: const TextStyle(
+                  fontSize: 16,
+                  color: AppTheme.textPrimary,
+                  fontWeight: FontWeight.w500),
               textAlign: TextAlign.center,
             )
           : const Text(
@@ -665,17 +723,26 @@ class _ScannerScreenState extends State<ScannerScreen>
             GestureDetector(
               onTap: hasText ? _savePhrase : null,
               child: Container(
-                width: 48, height: 48,
+                width: 48,
+                height: 48,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: Colors.white,
-                  boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)],
+                  boxShadow: [
+                    BoxShadow(
+                        color: Colors.black.withOpacity(0.05), blurRadius: 10)
+                  ],
                 ),
-                child: Icon(Icons.download_rounded, color: hasText ? AppTheme.primary : AppTheme.textHint, size: 22),
+                child: Icon(Icons.download_rounded,
+                    color: hasText ? AppTheme.primary : AppTheme.textHint,
+                    size: 22),
               ),
             ),
             const SizedBox(height: 8),
-            Text('บันทึก', style: TextStyle(fontSize: 10, color: hasText ? AppTheme.textPrimary : AppTheme.textHint)),
+            Text('บันทึก',
+                style: TextStyle(
+                    fontSize: 10,
+                    color: hasText ? AppTheme.textPrimary : AppTheme.textHint)),
           ],
         ),
 
@@ -686,21 +753,35 @@ class _ScannerScreenState extends State<ScannerScreen>
               onTap: hasText ? _replayFull : null,
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 200),
-                width: 68, height: 68,
+                width: 68,
+                height: 68,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: AppTheme.success,
-                  boxShadow: hasText && !_isTtsSpeaking ? [BoxShadow(color: AppTheme.success.withOpacity(0.4), blurRadius: 15, offset: const Offset(0, 5))] : [],
+                  boxShadow: hasText && !_isTtsSpeaking
+                      ? [
+                          BoxShadow(
+                              color: AppTheme.success.withOpacity(0.4),
+                              blurRadius: 15,
+                              offset: const Offset(0, 5))
+                        ]
+                      : [],
                 ),
                 child: Icon(
-                  _isTtsSpeaking ? Icons.volume_up_rounded : Icons.volume_up_rounded,
+                  _isTtsSpeaking
+                      ? Icons.volume_up_rounded
+                      : Icons.volume_up_rounded,
                   color: Colors.white,
                   size: 32,
                 ),
               ),
             ),
             const SizedBox(height: 8),
-            const Text('Voice', style: TextStyle(fontSize: 12, color: AppTheme.textPrimary, fontWeight: FontWeight.w600)),
+            const Text('Voice',
+                style: TextStyle(
+                    fontSize: 12,
+                    color: AppTheme.textPrimary,
+                    fontWeight: FontWeight.w600)),
           ],
         ),
 
@@ -709,20 +790,29 @@ class _ScannerScreenState extends State<ScannerScreen>
           children: [
             GestureDetector(
               onTap: () {
-                setState(() { _words = []; _state = _SpeakingState.idle; });
+                setState(() {
+                  _words = [];
+                  _state = _SpeakingState.idle;
+                });
               },
               child: Container(
-                width: 48, height: 48,
+                width: 48,
+                height: 48,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: Colors.white,
-                  boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)],
+                  boxShadow: [
+                    BoxShadow(
+                        color: Colors.black.withOpacity(0.05), blurRadius: 10)
+                  ],
                 ),
-                child: const Icon(Icons.restart_alt_rounded, color: AppTheme.textSecondary, size: 22),
+                child: const Icon(Icons.restart_alt_rounded,
+                    color: AppTheme.textSecondary, size: 22),
               ),
             ),
             const SizedBox(height: 8),
-            const Text('Reset', style: TextStyle(fontSize: 10, color: AppTheme.textPrimary)),
+            const Text('Reset',
+                style: TextStyle(fontSize: 10, color: AppTheme.textPrimary)),
           ],
         ),
       ],
@@ -742,12 +832,12 @@ class _CornerPainter extends CustomPainter {
       ..strokeWidth = strokeWidth
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.square;
-      
+
     final path = Path()
       ..moveTo(0, size.height)
       ..lineTo(0, 0)
       ..lineTo(size.width, 0);
-      
+
     canvas.drawPath(path, paint);
   }
 
