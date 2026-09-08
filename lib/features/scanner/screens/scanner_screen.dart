@@ -78,7 +78,14 @@ class _ScannerScreenState extends State<ScannerScreen>
   bool _isPredicting = false;
   Timer? _apiStatusTimer;
   static const Duration _apiStatusRecheckInterval = Duration(seconds: 20);
-  static const int _maxCollectFrames = 75; // จำนวน frames สูงสุดที่เก็บ
+  // จำนวน frames สูงสุดที่เก็บต่อการพูด 1 รอบ
+  //
+  // ⚠️ ค่าเดิม 75 ทำให้ server บนแพลน Free ของ Render (0.1 CPU / 512MB RAM)
+  // ล่มจริง — ทดสอบยิง 75 เฟรมแล้วได้ 502 กลับมา และ instance ต้อง restart
+  // เองอยู่หลายนาทีกว่าจะกลับมาใช้ได้ ส่วน 40 เฟรมยังตอบ 200 ปกติ จึงลดเพดาน
+  // ลงมาให้ต่ำกว่าจุดที่ล่ม และช่วยลดเวลารอไปด้วย (เวลาประมวลผลแปรผันตาม
+  // จำนวนภาพที่ส่ง) การใช้งานจึงควรพูดเป็นวลีสั้นๆ ทีละช่วง
+  static const int _maxCollectFrames = 40;
 
   static const List<List<String>> _wordPool = [
     ['สวัสดี', 'ครับ'],
@@ -248,6 +255,12 @@ class _ScannerScreenState extends State<ScannerScreen>
         // 🟢 เก็บ lip frames ขณะกำลังพูด (สำหรับส่งไป API)
         if (_state == _SpeakingState.speaking && _isApiAvailable && _collectedLipFrames.length < _maxCollectFrames) {
           await _collectLipFrame(image, face);
+          // ถ้าเก็บครบ cap แล้วแต่ยังพูดต่อไม่หยุด ส่งเท่าที่มีไปประมวลผลเลย
+          // ดีกว่าปล่อยให้ผู้ใช้รอเก้อจนกว่าจะตรวจพบว่าหยุดพูดจริง (frame ส่วน
+          // ที่เกินมาจะไม่ถูกเก็บต่ออยู่ดี ไม่มีประโยชน์ที่จะรอเฉยๆ)
+          if (_collectedLipFrames.length >= _maxCollectFrames) {
+            _finalizeUtterance();
+          }
         }
       }
     } catch (e) {
