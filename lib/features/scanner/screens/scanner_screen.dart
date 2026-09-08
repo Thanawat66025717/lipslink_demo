@@ -1,25 +1,24 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
-import 'package:hive_flutter/hive_flutter.dart';
 import 'package:uuid/uuid.dart';
 import 'package:flutter/foundation.dart';
+import 'dart:ui' as ui;
+// 🟢 เพิ่ม Firebase 
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
 import '../../../app/theme/app_theme.dart';
-import '../../../shared/models/phrase_model.dart';
 import '../../../shared/services/tts_service.dart';
 import '../../../shared/services/storage_service.dart';
+import '../../../shared/services/lip_reading_api_service.dart';
 
-/// ─────────────────────────────────────────────────────────────────────────────
-/// Real-time lip reading scanner screen
-/// Pipeline:
-///   Camera image stream → ML Kit FaceDetector → mouth open/close ratio
-///   → speaking state machine → simulate word-by-word detection
-///   → word-by-word TTS playback in real-time
-/// ─────────────────────────────────────────────────────────────────────────────
 class ScannerScreen extends StatefulWidget {
   const ScannerScreen({super.key});
 
@@ -38,12 +37,18 @@ class _ScannerScreenState extends State<ScannerScreen>
   // ─── ML Kit ───────────────────────────────────────────────────────────────
   final FaceDetector _faceDetector = FaceDetector(
     options: FaceDetectorOptions(
-      enableClassification: true, // gives mouthOpenProbability
+      enableClassification: true, 
       enableLandmarks: true,
+      enableContours: true,
       performanceMode: FaceDetectorMode.fast,
     ),
   );
   bool _isProcessingFrame = false;
+
+  // ─── Face Overlay ─────────────────────────────────────────────────────────
+  List<Face> _detectedFaces = [];
+  Size? _imageSize;
+  InputImageRotation? _imageRotation;
 
   // ─── Mouth state ──────────────────────────────────────────────────────────
   double _mouthOpenProb = 0.0;
@@ -52,10 +57,9 @@ class _ScannerScreenState extends State<ScannerScreen>
   static const double _mouthCloseThreshold = 0.20;
 
   // ─── Speaking state machine ────────────────────────────────────────────────
-  // States: idle → listening → speaking → paused → finalizing
   _SpeakingState _state = _SpeakingState.idle;
-  Timer? _silenceTimer; // fires when mouth closed long enough → finalize
-  Timer? _wordTimer; // fires to emit next simulated word
+  Timer? _silenceTimer; 
+  Timer? _wordTimer; 
   Duration _silenceGap = const Duration(milliseconds: 800);
   int _consecutiveSilenceFrames = 0;
   int _consecutiveSpeakFrames = 0;
@@ -63,12 +67,18 @@ class _ScannerScreenState extends State<ScannerScreen>
   static const int _silenceFrameThreshold = 8;
 
   // ─── Output ───────────────────────────────────────────────────────────────
-  /// Words emitted so far in the current utterance
   List<String> _words = [];
   String get _displayText => _words.join(' ');
   String _currentEmotion = 'neutral';
 
-  /// Pool of simulated phrases (word lists)
+  // ─── AI Lip Reading ────────────────────────────────────────────────────────
+  List<Uint8List> _collectedLipFrames = [];
+  bool _isApiAvailable = false;
+  bool _isPredicting = false;
+  Timer? _apiStatusTimer;
+  static const Duration _apiStatusRecheckInterval = Duration(seconds: 20);
+  static const int _maxCollectFrames = 75; // จำนวน frames สูงสุดที่เก็บ
+
   static const List<List<String>> _wordPool = [
     ['สวัสดี', 'ครับ'],
     ['ขอบคุณ', 'มาก', 'ครับ'],
@@ -134,6 +144,22 @@ class _ScannerScreenState extends State<ScannerScreen>
     )..repeat();
     _loadUser();
     _initCamera();
+    _checkApiStatus();
+    _apiStatusTimer = Timer.periodic(
+      _apiStatusRecheckInterval,
+      (_) => _checkApiStatus(),
+    );
+  }
+
+  Future<void> _checkApiStatus() async {
+    // อย่า re-check ระหว่างที่กำลังเก็บ frame/ทำนายผลอยู่ เพื่อไม่ให้ค่า
+    // _isApiAvailable เปลี่ยนกลางคันขณะ flow กำลังทำงาน
+    if (_isPredicting) return;
+    final available = await LipReadingApiService.checkHealth();
+    if (mounted && available != _isApiAvailable) {
+      setState(() => _isApiAvailable = available);
+      debugPrint(available ? '✅ API Server พร้อมใช้งาน' : '⚠️ API Server ไม่พร้อม — ใช้โหมดสุ่มคำแทน');
+    }
   }
 
   Future<void> _loadUser() async {
@@ -141,7 +167,6 @@ class _ScannerScreenState extends State<ScannerScreen>
     if (mounted) setState(() => _userName = user?.name.split(' ').first ?? '');
   }
 
-  // ─── Camera init ──────────────────────────────────────────────────────────
   Future<void> _initCamera() async {
     try {
       _cameras = await availableCameras();
@@ -161,7 +186,9 @@ class _ScannerScreenState extends State<ScannerScreen>
       _cameras[index],
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.nv21, // best for ML Kit on Android
+      imageFormatGroup: defaultTargetPlatform == TargetPlatform.android
+          ? ImageFormatGroup.yuv420
+          : ImageFormatGroup.bgra8888,
     );
 
     await controller.initialize();
@@ -173,7 +200,6 @@ class _ScannerScreenState extends State<ScannerScreen>
     _cameraController?.dispose();
     _cameraController = controller;
 
-    // Start image stream for real-time processing
     if (!kIsWeb) {
       await controller.startImageStream(_onCameraFrame);
     }
@@ -191,7 +217,6 @@ class _ScannerScreenState extends State<ScannerScreen>
     await _startCamera(nextIndex);
   }
 
-  // ─── ML Kit frame processing ──────────────────────────────────────────────
   Future<void> _onCameraFrame(CameraImage image) async {
     if (_isProcessingFrame) return;
     _isProcessingFrame = true;
@@ -210,15 +235,26 @@ class _ScannerScreenState extends State<ScannerScreen>
         return;
       }
 
+      // 🟢 เก็บข้อมูลใบหน้าสำหรับวาด Overlay
+      final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation) ?? InputImageRotation.rotation0deg;
+      setState(() {
+        _detectedFaces = faces;
+        _imageSize = Size(image.width.toDouble(), image.height.toDouble());
+        _imageRotation = rotation;
+      });
+
       if (faces.isEmpty) {
         _updateMouthState(0.0, faceDetected: false);
       } else {
         final face = faces.first;
         final prob = face.smilingProbability ?? 0.0;
-        // Use leftEyeOpenProbability as proxy for mouth + face liveliness
-        // mouthOpenProbability is the key value from ML Kit classification
         final mouthOpen = _estimateMouthOpen(face);
         _updateMouthState(mouthOpen, faceDetected: true, smiling: prob > 0.6);
+
+        // 🟢 เก็บ lip frames ขณะกำลังพูด (สำหรับส่งไป API)
+        if (_state == _SpeakingState.speaking && _isApiAvailable && _collectedLipFrames.length < _maxCollectFrames) {
+          _collectLipFrame(image, face);
+        }
       }
     } catch (e) {
       debugPrint('ML Kit error: $e');
@@ -227,20 +263,72 @@ class _ScannerScreenState extends State<ScannerScreen>
     _isProcessingFrame = false;
   }
 
+  /// เก็บภาพปากจาก camera frame โดยครอปจาก face bounding box
+  void _collectLipFrame(CameraImage image, Face face) {
+    try {
+      // ครอปบริเวณปากจาก face bounding box
+      final rect = face.boundingBox;
+      // ปากอยู่ประมาณครึ่งล่างของใบหน้า
+      final mouthTop = rect.top + rect.height * 0.6;
+      final mouthHeight = rect.height * 0.4;
+      final mouthLeft = rect.left + rect.width * 0.1;
+      final mouthWidth = rect.width * 0.8;
+
+      // แปลง NV21 เป็น grayscale (Y channel เท่านั้น)
+      final int width = image.width;
+      final int height = image.height;
+      final yPlane = image.planes[0].bytes;
+
+      // Crop mouth region จาก Y plane
+      final int cropX = mouthLeft.toInt().clamp(0, width - 1);
+      final int cropY = mouthTop.toInt().clamp(0, height - 1);
+      final int cropW = mouthWidth.toInt().clamp(1, width - cropX);
+      final int cropH = mouthHeight.toInt().clamp(1, height - cropY);
+
+      // สร้าง cropped image bytes
+      final croppedBytes = Uint8List(cropW * cropH);
+      for (int y = 0; y < cropH; y++) {
+        for (int x = 0; x < cropW; x++) {
+          final srcIdx = (cropY + y) * image.planes[0].bytesPerRow + (cropX + x);
+          if (srcIdx < yPlane.length) {
+            croppedBytes[y * cropW + x] = yPlane[srcIdx];
+          }
+        }
+      }
+
+      // Encode เป็น PNG bytes สำหรับส่งไป API
+      // สร้าง simple grayscale image data
+      _collectedLipFrames.add(croppedBytes);
+    } catch (e) {
+      debugPrint('Lip frame collection error: $e');
+    }
+  }
+
   InputImage? _buildInputImage(CameraImage image, CameraDescription camera) {
     try {
-      final WriteBuffer allBytes = WriteBuffer();
-      for (final Plane plane in image.planes) {
-        allBytes.putUint8List(plane.bytes);
+      Uint8List bytes;
+      InputImageFormat format;
+      int bytesPerRow;
+
+      if (defaultTargetPlatform == TargetPlatform.android) {
+        bytes = _convertCameraImageToNv21(image);
+        format = InputImageFormat.nv21;
+        bytesPerRow = image.width; // Padding removed
+      } else {
+        // iOS
+        final WriteBuffer allBytes = WriteBuffer();
+        for (final Plane plane in image.planes) {
+          allBytes.putUint8List(plane.bytes);
+        }
+        bytes = allBytes.done().buffer.asUint8List();
+        
+        format = InputImageFormatValue.fromRawValue(image.format.raw) ?? InputImageFormat.bgra8888;
+        bytesPerRow = image.planes.isNotEmpty ? image.planes[0].bytesPerRow : image.width;
       }
-      final bytes = allBytes.done().buffer.asUint8List();
 
       final rotation =
           InputImageRotationValue.fromRawValue(camera.sensorOrientation) ??
               InputImageRotation.rotation0deg;
-
-      final format = InputImageFormatValue.fromRawValue(image.format.raw);
-      if (format == null) return null;
 
       return InputImage.fromBytes(
         bytes: bytes,
@@ -248,25 +336,90 @@ class _ScannerScreenState extends State<ScannerScreen>
           size: Size(image.width.toDouble(), image.height.toDouble()),
           rotation: rotation,
           format: format,
-          bytesPerRow: image.planes[0].bytesPerRow,
+          bytesPerRow: bytesPerRow,
         ),
       );
     } catch (e) {
+      debugPrint('Error building InputImage: $e');
       return null;
     }
   }
 
-  /// Estimate mouth openness from face landmarks
+  Uint8List _convertCameraImageToNv21(CameraImage image) {
+    final width = image.width;
+    final height = image.height;
+    final expectedSize = (width * height * 1.5).toInt();
+    final nv21 = Uint8List(expectedSize);
+
+    if (image.planes.length == 1) {
+      final plane = image.planes[0];
+      final bytesPerRow = plane.bytesPerRow;
+      if (bytesPerRow == width) {
+        if (plane.bytes.length == expectedSize) return plane.bytes;
+        return plane.bytes.sublist(0, expectedSize);
+      }
+      
+      int dstIndex = 0;
+      for (int y = 0; y < height; y++) {
+        final srcOffset = y * bytesPerRow;
+        for (int x = 0; x < width; x++) {
+          nv21[dstIndex++] = plane.bytes[srcOffset + x];
+        }
+      }
+      final uvHeight = height ~/ 2;
+      final uvOffset = height * bytesPerRow;
+      for (int y = 0; y < uvHeight; y++) {
+        final srcOffset = uvOffset + (y * bytesPerRow);
+        for (int x = 0; x < width; x++) {
+          nv21[dstIndex++] = plane.bytes[srcOffset + x];
+        }
+      }
+      return nv21;
+    } else if (image.planes.length == 3) {
+      final yPlane = image.planes[0];
+      final uPlane = image.planes[1];
+      final vPlane = image.planes[2];
+      
+      final yRowStride = yPlane.bytesPerRow;
+      final uvRowStride = uPlane.bytesPerRow;
+      final uvPixelStride = uPlane.bytesPerPixel ?? 1;
+
+      int dstIndex = 0;
+      
+      for (int y = 0; y < height; y++) {
+        final srcOffset = y * yRowStride;
+        for (int x = 0; x < width; x++) {
+          nv21[dstIndex++] = yPlane.bytes[srcOffset + x];
+        }
+      }
+      
+      final uvHeight = height ~/ 2;
+      final uvWidth = width ~/ 2;
+      for (int y = 0; y < uvHeight; y++) {
+        final srcOffset = y * uvRowStride;
+        for (int x = 0; x < uvWidth; x++) {
+          final uvIndex = srcOffset + (x * uvPixelStride);
+          nv21[dstIndex++] = vPlane.bytes[uvIndex];
+          nv21[dstIndex++] = uPlane.bytes[uvIndex];
+        }
+      }
+      return nv21;
+    }
+    
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final Plane plane in image.planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    return allBytes.done().buffer.asUint8List();
+  }
+
   double _estimateMouthOpen(Face face) {
-    // ML Kit provides mouth contour points when landmarks enabled
     final bottomMouth = face.landmarks[FaceLandmarkType.bottomMouth];
     final leftMouth = face.landmarks[FaceLandmarkType.leftMouth];
     final rightMouth = face.landmarks[FaceLandmarkType.rightMouth];
 
     if (bottomMouth != null && leftMouth != null && rightMouth != null) {
-      // Approximate mouth height vs width ratio
       final mouthWidth = (rightMouth.position.x - leftMouth.position.x).abs();
-      // Use nose-to-mouth distance as reference
       final noseBase = face.landmarks[FaceLandmarkType.noseBase];
       if (noseBase != null && mouthWidth > 0) {
         final noseToMouth =
@@ -275,14 +428,9 @@ class _ScannerScreenState extends State<ScannerScreen>
         return ratio.clamp(0.0, 1.0);
       }
     }
-
-    // Fallback: use bounding box tracking trick — mouth open produces
-    // slightly different face bbox aspect ratio, but this is unreliable.
-    // Use a random-walk simulation anchored to face detection as fallback.
     return 0.0;
   }
 
-  // ─── Speaking state machine ────────────────────────────────────────────────
   void _updateMouthState(double mouthOpen,
       {required bool faceDetected, bool smiling = false}) {
     if (!mounted) return;
@@ -334,24 +482,31 @@ class _ScannerScreenState extends State<ScannerScreen>
     _consecutiveSpeakFrames = 0;
     _consecutiveSilenceFrames = 0;
 
-    // Pick random phrase
-    final rng = Random();
-    final idx = rng.nextInt(_wordPool.length);
-    _currentWordList = _wordPool[idx];
-    _currentEmotion = _emotionPool[idx];
-    _wordIndex = 0;
+    // 🟢 เคลียร์ frames ที่เก็บไว้
+    _collectedLipFrames = [];
+
+    if (!_isApiAvailable) {
+      // Fallback: ใช้คำสุ่มเมื่อ API ไม่พร้อม
+      final rng = Random();
+      final idx = rng.nextInt(_wordPool.length);
+      _currentWordList = _wordPool[idx];
+      _currentEmotion = _emotionPool[idx];
+      _wordIndex = 0;
+    }
 
     setState(() {
       _state = _SpeakingState.speaking;
       _words = [];
     });
 
-    _scheduleNextWord();
+    if (!_isApiAvailable) {
+      _scheduleNextWord();
+    }
+    // ถ้า API พร้อม จะรอเก็บ frames แล้วส่งตอน finalize
   }
 
   void _scheduleNextWord() {
     if (_wordIndex >= _currentWordList.length) {
-      // All words emitted
       _finalizeUtterance();
       return;
     }
@@ -363,7 +518,6 @@ class _ScannerScreenState extends State<ScannerScreen>
       final word = _currentWordList[_wordIndex++];
       setState(() => _words = [..._words, word]);
 
-      // Speak word immediately (real-time!)
       _speakWordRealtime(word);
 
       _scheduleNextWord();
@@ -371,7 +525,6 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 
   Future<void> _speakWordRealtime(String word) async {
-    // Each word spoken as it appears
     final tts = TtsService();
     await tts.speakWord(word, emotion: _currentEmotion);
   }
@@ -392,51 +545,120 @@ class _ScannerScreenState extends State<ScannerScreen>
   void _finalizeUtterance() {
     _wordTimer?.cancel();
     _silenceTimer?.cancel();
+
+    // 🟢 ถ้า API พร้อม → ส่ง frames ไปทำ prediction
+    if (_isApiAvailable && _collectedLipFrames.isNotEmpty) {
+      _predictWithApi();
+      return;
+    }
+
     if (_words.isEmpty) {
       setState(() => _state = _SpeakingState.idle);
       return;
     }
     setState(() => _state = _SpeakingState.finalizing);
-    // After short pause go back to idle (ready for next)
+
     Future.delayed(const Duration(seconds: 3), () {
       if (mounted) setState(() => _state = _SpeakingState.idle);
     });
   }
 
-  // ─── Save phrase ──────────────────────────────────────────────────────────
+  /// 🟢 ส่ง lip frames ไป API แล้วรับข้อความกลับมา
+  Future<void> _predictWithApi() async {
+    if (_isPredicting) return;
+    setState(() {
+      _isPredicting = true;
+      _state = _SpeakingState.finalizing;
+      _words = ['กำลังอ่านปาก...'];
+    });
+
+    try {
+      final result = await LipReadingApiService.predictFromFrames(
+        _collectedLipFrames,
+        model: 'model1',
+      );
+
+      if (result != null && result.text.isNotEmpty && mounted) {
+        setState(() {
+          _words = [result.text];
+        });
+
+        // TTS อ่านออกเสียง
+        await _tts.speak(result.text, emotion: _currentEmotion);
+
+        debugPrint('🔮 AI Prediction: ${result.text} (confidence: ${(result.confidence * 100).toStringAsFixed(1)}%, time: ${result.processingTimeMs}ms)');
+      } else {
+        // Fallback ถ้า API ไม่ส่งผลลัพธ์
+        if (mounted) {
+          setState(() {
+            _words = ['(ไม่สามารถอ่านได้)'];
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('❌ API prediction error: $e');
+      if (mounted) {
+        setState(() {
+          _words = ['(เกิดข้อผิดพลาด)'];
+        });
+      }
+    } finally {
+      _collectedLipFrames = [];
+      if (mounted) {
+        setState(() => _isPredicting = false);
+        Future.delayed(const Duration(seconds: 4), () {
+          if (mounted) setState(() => _state = _SpeakingState.idle);
+        });
+      }
+    }
+  }
+
+  // ─── Save phrase to Firebase ──────────────────────────────────────────────
   Future<void> _savePhrase() async {
     if (_displayText.isEmpty) return;
-    final box = Hive.box<PhraseModel>('phrases');
-    final existing = box.values
-        .cast<PhraseModel?>()
-        .firstWhere((p) => p?.text == _displayText, orElse: () => null);
-    if (existing != null) {
-      existing.usageCount++;
-      await existing.save();
-    } else {
-      await box.add(PhraseModel(
-        id: _uuid.v4(),
-        text: _displayText,
-        emotion: _currentEmotion,
-        createdAt: DateTime.now(),
-      ));
-    }
-    if (mounted) {
+
+    final userAuth = FirebaseAuth.instance.currentUser;
+    if (userAuth == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Row(children: [
-            const Icon(Icons.bookmark_added, color: Colors.white, size: 18),
-            const SizedBox(width: 8),
-            Text('บันทึก "$_displayText" แล้ว'),
-          ]),
-          backgroundColor: AppTheme.success,
-          behavior: SnackBarBehavior.floating,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          margin: const EdgeInsets.all(16),
-          duration: const Duration(seconds: 2),
-        ),
+        const SnackBar(content: Text('กรุณาล็อกอินเพื่อบันทึกประวัติ'), backgroundColor: Colors.red),
       );
+      return;
+    }
+
+    try {
+      final phraseId = _uuid.v4();
+      
+      // 🟢 บันทึกขึ้น Firebase Firestore โดยตรง
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(userAuth.uid) 
+          .collection('history') 
+          .doc(phraseId) 
+          .set({
+        'id': phraseId,
+        'text': _displayText,
+        'emotion': _currentEmotion,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(children: [
+              const Icon(Icons.cloud_done, color: Colors.white, size: 18),
+              const SizedBox(width: 8),
+              Text('บันทึก "$_displayText" ลงคลาวด์แล้ว'),
+            ]),
+            backgroundColor: AppTheme.success,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            margin: const EdgeInsets.all(16),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('❌ Firebase Error: $e');
     }
   }
 
@@ -450,11 +672,11 @@ class _ScannerScreenState extends State<ScannerScreen>
     });
   }
 
-  // ─── Dispose ──────────────────────────────────────────────────────────────
   @override
   void dispose() {
     _wordTimer?.cancel();
     _silenceTimer?.cancel();
+    _apiStatusTimer?.cancel();
     _pulseCtrl.dispose();
     _waveCtrl.dispose();
     _cameraController?.stopImageStream();
@@ -464,49 +686,6 @@ class _ScannerScreenState extends State<ScannerScreen>
     super.dispose();
   }
 
-  // ─── UI helpers ───────────────────────────────────────────────────────────
-  Color get _emotionColor {
-    switch (_currentEmotion) {
-      case 'happy':
-        return const Color(0xFF4CAF50);
-      case 'sad':
-        return const Color(0xFF2196F3);
-      case 'angry':
-        return const Color(0xFFEF5350);
-      default:
-        return AppTheme.textSecondary;
-    }
-  }
-
-  String get _emotionLabel {
-    switch (_currentEmotion) {
-      case 'happy':
-        return '😊 มีความสุข';
-      case 'sad':
-        return '😢 เศร้า';
-      case 'angry':
-        return '😠 โกรธ';
-      default:
-        return '😐 ปกติ';
-    }
-  }
-
-  String get _stateLabel {
-    switch (_state) {
-      case _SpeakingState.idle:
-        return 'รอตรวจจับ...';
-      case _SpeakingState.speaking:
-        return '🎙 กำลังวิเคราะห์...';
-      case _SpeakingState.paused:
-        return '⏸ หยุดชั่วคราว';
-      case _SpeakingState.finalizing:
-        return '✅ วิเคราะห์เสร็จแล้ว';
-      default:
-        return '';
-    }
-  }
-
-  // ─── Build ────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -531,6 +710,10 @@ class _ScannerScreenState extends State<ScannerScreen>
                       const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
                   child: Column(
                     children: [
+                      if (!_isApiAvailable) ...[
+                        _buildApiFallbackBanner(),
+                        const SizedBox(height: 16),
+                      ],
                       _buildCameraCard(),
                       const SizedBox(height: 24),
                       _buildSpeechBubble(),
@@ -543,6 +726,34 @@ class _ScannerScreenState extends State<ScannerScreen>
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildApiFallbackBanner() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.orange.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.orange.withOpacity(0.4)),
+      ),
+      child: const Row(
+        children: [
+          Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 20),
+          SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'เชื่อมต่อ AI server ไม่ได้ — กำลังใช้โหมดจำลองคำ (ไม่ใช่ผลอ่านปากจริง)',
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: Colors.orange,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -574,7 +785,6 @@ class _ScannerScreenState extends State<ScannerScreen>
         child: Stack(
           fit: StackFit.expand,
           children: [
-            // Camera preview or placeholder
             _cameraReady && _cameraController != null
                 ? CameraPreview(_cameraController!)
                 : Container(
@@ -595,86 +805,33 @@ class _ScannerScreenState extends State<ScannerScreen>
                       ],
                     ),
                   ),
-
-            // Face detection frame (Green corners)
-            if (_cameraReady) _buildFaceFrame(),
+            if (_cameraReady) _buildFaceOverlay(),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildFaceFrame() {
-    final isActive = _state == _SpeakingState.speaking;
-    // We want to simulate the green box and corners from the mockup
-    return Stack(
-      children: [
-        Center(
-          child: Container(
-            width: 220,
-            height: 220,
-            decoration: BoxDecoration(
-              border: Border.all(
-                color: isActive
-                    ? AppTheme.success
-                    : AppTheme.success.withOpacity(0.5),
-                width: 2,
-              ),
-            ),
+  Widget _buildFaceOverlay() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return CustomPaint(
+          size: Size(constraints.maxWidth, constraints.maxHeight),
+          painter: _FaceOverlayPainter(
+            faces: _detectedFaces,
+            imageSize: _imageSize ?? const Size(480, 640),
+            rotation: _imageRotation ?? InputImageRotation.rotation0deg,
+            canvasSize: Size(constraints.maxWidth, constraints.maxHeight),
+            isFrontCamera: _isFrontCamera,
+            isSpeaking: _state == _SpeakingState.speaking,
+            faceDetected: _faceDetected,
+            mouthOpenProb: _mouthOpenProb,
           ),
-        ),
-        // Draw corners
-        Center(
-          child: SizedBox(
-            width: 220,
-            height: 220,
-            child: Stack(
-              children: [
-                Positioned(top: -2, left: -2, child: _buildCorner()),
-                Positioned(
-                    top: -2,
-                    right: -2,
-                    child: RotatedBox(quarterTurns: 1, child: _buildCorner())),
-                Positioned(
-                    bottom: -2,
-                    right: -2,
-                    child: RotatedBox(quarterTurns: 2, child: _buildCorner())),
-                Positioned(
-                    bottom: -2,
-                    left: -2,
-                    child: RotatedBox(quarterTurns: 3, child: _buildCorner())),
-              ],
-            ),
-          ),
-        ),
-        // Draw inner mouth box approx
-        Center(
-          child: Padding(
-            padding: const EdgeInsets.only(top: 80), // push down to mouth area
-            child: Container(
-              width: 80,
-              height: 40,
-              decoration: BoxDecoration(
-                border: Border.all(
-                  color: AppTheme.success.withOpacity(isActive ? 0.8 : 0.3),
-                  width: 1.5,
-                ),
-              ),
-            ),
-          ),
-        ),
-      ],
+        );
+      },
     );
   }
 
-  Widget _buildCorner() {
-    return CustomPaint(
-      size: const Size(20, 20),
-      painter: _CornerPainter(color: AppTheme.success, strokeWidth: 4),
-    );
-  }
-
-  // ─── Speech bubble card (wireframe style) ────────────────────────────────
   Widget _buildSpeechBubble() {
     final hasText = _words.isNotEmpty;
     return AnimatedContainer(
@@ -710,14 +867,12 @@ class _ScannerScreenState extends State<ScannerScreen>
     );
   }
 
-  // ─── Action row: play + save ───────────────────────────────────────────────
   Widget _buildActionRow() {
     final hasText = _words.isNotEmpty;
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       crossAxisAlignment: CrossAxisAlignment.end,
       children: [
-        // Save button
         Column(
           children: [
             GestureDetector(
@@ -745,8 +900,6 @@ class _ScannerScreenState extends State<ScannerScreen>
                     color: hasText ? AppTheme.textPrimary : AppTheme.textHint)),
           ],
         ),
-
-        // Voice button (Green)
         Column(
           children: [
             GestureDetector(
@@ -784,8 +937,6 @@ class _ScannerScreenState extends State<ScannerScreen>
                     fontWeight: FontWeight.w600)),
           ],
         ),
-
-        // Reset button
         Column(
           children: [
             GestureDetector(
@@ -820,89 +971,207 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 }
 
-class _CornerPainter extends CustomPainter {
-  final Color color;
-  final double strokeWidth;
-  _CornerPainter({required this.color, required this.strokeWidth});
+class _FaceOverlayPainter extends CustomPainter {
+  final List<Face> faces;
+  final Size imageSize;
+  final InputImageRotation rotation;
+  final Size canvasSize;
+  final bool isFrontCamera;
+  final bool isSpeaking;
+  final bool faceDetected;
+  final double mouthOpenProb;
 
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = color
-      ..strokeWidth = strokeWidth
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.square;
-
-    final path = Path()
-      ..moveTo(0, size.height)
-      ..lineTo(0, 0)
-      ..lineTo(size.width, 0);
-
-    canvas.drawPath(path, paint);
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-// ─── Enums & Sub-widgets ─────────────────────────────────────────────────────
-
-enum _SpeakingState { idle, speaking, paused, finalizing }
-
-/// Animated word chip that bounces in when a new word is detected
-class _WordChip extends StatelessWidget {
-  final String word;
-  final int index;
-  final Color emotionColor;
-
-  const _WordChip({
-    required this.word,
-    required this.index,
-    required this.emotionColor,
+  _FaceOverlayPainter({
+    required this.faces,
+    required this.imageSize,
+    required this.rotation,
+    required this.canvasSize,
+    required this.isFrontCamera,
+    required this.isSpeaking,
+    required this.faceDetected,
+    required this.mouthOpenProb,
   });
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      decoration: BoxDecoration(
-        color: emotionColor.withOpacity(0.10),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: emotionColor.withOpacity(0.25)),
-      ),
-      child: Text(
-        word,
+  void paint(Canvas canvas, Size size) {
+    if (faces.isEmpty) {
+      _drawIdleFrame(canvas, size);
+      return;
+    }
+
+    for (final face in faces) {
+      _drawFaceTracking(canvas, size, face);
+    }
+  }
+
+  void _drawIdleFrame(Canvas canvas, Size size) {
+    final textPainter = TextPainter(
+      text: const TextSpan(
+        text: 'หันหน้าเข้ากล้อง',
         style: TextStyle(
-          fontSize: 22,
-          fontWeight: FontWeight.w700,
-          color: AppTheme.textPrimary,
+          color: Colors.white70,
+          fontSize: 16,
+          fontWeight: FontWeight.w500,
         ),
       ),
-    )
-        .animate()
-        .scale(
-          begin: const Offset(0.5, 0.5),
-          duration: 220.ms,
-          curve: Curves.elasticOut,
-        )
-        .fadeIn(duration: 150.ms);
+      textDirection: TextDirection.ltr,
+    )..layout();
+    
+    textPainter.paint(canvas, const Offset(16, 16));
+  }
+
+  void _drawFaceTracking(Canvas canvas, Size size, Face face) {
+    // 1) Text "พบใบหน้า" or "กำลังพูด..."
+    final label = isSpeaking ? 'กำลังพูด...' : 'พบใบหน้า';
+    final textColor = isSpeaking ? const Color(0xFF4CAF50) : const Color(0xFF00FF00);
+
+    final textPainter = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: TextStyle(
+          color: textColor,
+          fontSize: 14,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    
+    textPainter.paint(canvas, const Offset(16, 16));
+
+    // 2) Contour Wireframe Mesh — เส้นตาข่ายตาม contour ของใบหน้า
+    final contourTypes = [
+      FaceContourType.face,
+      FaceContourType.leftEyebrowTop,
+      FaceContourType.leftEyebrowBottom,
+      FaceContourType.rightEyebrowTop,
+      FaceContourType.rightEyebrowBottom,
+      FaceContourType.leftEye,
+      FaceContourType.rightEye,
+      FaceContourType.noseBottom,
+      FaceContourType.noseBridge,
+      FaceContourType.upperLipTop,
+      FaceContourType.upperLipBottom,
+      FaceContourType.lowerLipTop,
+      FaceContourType.lowerLipBottom,
+    ];
+
+    for (final type in contourTypes) {
+      final contour = face.contours[type];
+      if (contour == null || contour.points.isEmpty) continue;
+
+      final points = contour.points.map((p) => _scalePoint(p, size)).toList();
+
+      // กำหนดสีเป็นสีเขียวสไตล์ AI Vision
+      Color lineColor = const Color(0xFF00FF00); 
+      double lineWidth = 0.8;
+      double dotRadius = 1.5;
+      
+      final isLip = type == FaceContourType.upperLipTop ||
+          type == FaceContourType.upperLipBottom ||
+          type == FaceContourType.lowerLipTop ||
+          type == FaceContourType.lowerLipBottom;
+      final isEye = type == FaceContourType.leftEye ||
+          type == FaceContourType.rightEye;
+
+      if (isLip) {
+        lineColor = isSpeaking ? const Color(0xFF4CAF50) : const Color(0xFF00FF00);
+        lineWidth = 1.2;
+        dotRadius = 2.0;
+      } else if (isEye) {
+        lineWidth = 1.0;
+        dotRadius = 1.8;
+      }
+
+      // วาดเส้นเชื่อมจุด contour
+      final linePaint = Paint()
+        ..color = lineColor.withOpacity(0.5) // เส้นเขียวจางๆ
+        ..strokeWidth = lineWidth
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round;
+
+      if (points.length > 1) {
+        final path = Path()..moveTo(points.first.dx, points.first.dy);
+        for (int i = 1; i < points.length; i++) {
+          path.lineTo(points[i].dx, points[i].dy);
+        }
+        // ปิดเส้นสำหรับ ตา, ขอบหน้า
+        if (isEye || type == FaceContourType.face) {
+          path.close();
+        }
+        canvas.drawPath(path, linePaint);
+      }
+
+      // วาดจุดสีเขียว
+      final dotPaint = Paint()
+        ..color = lineColor
+        ..style = PaintingStyle.fill;
+      for (final p in points) {
+        canvas.drawCircle(p, dotRadius, dotPaint);
+      }
+    }
+  }
+
+  Rect _scaleRect(Rect faceRect, Size widgetSize) {
+    double imageW, imageH;
+
+    if (rotation == InputImageRotation.rotation90deg ||
+        rotation == InputImageRotation.rotation270deg) {
+      imageW = imageSize.height;
+      imageH = imageSize.width;
+    } else {
+      imageW = imageSize.width;
+      imageH = imageSize.height;
+    }
+
+    final scaleX = widgetSize.width / imageW;
+    final scaleY = widgetSize.height / imageH;
+
+    double left = faceRect.left * scaleX;
+    double top = faceRect.top * scaleY;
+    double right = faceRect.right * scaleX;
+    double bottom = faceRect.bottom * scaleY;
+
+    if (isFrontCamera) {
+      final tempLeft = widgetSize.width - right;
+      right = widgetSize.width - left;
+      left = tempLeft;
+    }
+
+    return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  Offset _scalePoint(Point<int> point, Size widgetSize) {
+    double imageW, imageH;
+
+    if (rotation == InputImageRotation.rotation90deg ||
+        rotation == InputImageRotation.rotation270deg) {
+      imageW = imageSize.height;
+      imageH = imageSize.width;
+    } else {
+      imageW = imageSize.width;
+      imageH = imageSize.height;
+    }
+
+    final scaleX = widgetSize.width / imageW;
+    final scaleY = widgetSize.height / imageH;
+
+    double x = point.x.toDouble() * scaleX;
+    double y = point.y.toDouble() * scaleY;
+
+    if (isFrontCamera) {
+      x = widgetSize.width - x;
+    }
+
+    return Offset(x, y);
+  }
+
+  @override
+  bool shouldRepaint(covariant _FaceOverlayPainter oldDelegate) {
+    return oldDelegate.faces != faces ||
+        oldDelegate.isSpeaking != isSpeaking ||
+        oldDelegate.mouthOpenProb != mouthOpenProb;
   }
 }
 
-/// Blinking typing cursor shown while detecting
-class _TypingCursor extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 3,
-      height: 28,
-      decoration: BoxDecoration(
-        color: AppTheme.primary,
-        borderRadius: BorderRadius.circular(2),
-      ),
-    )
-        .animate(onPlay: (c) => c.repeat())
-        .fadeIn(duration: 400.ms)
-        .then()
-        .fadeOut(duration: 400.ms);
-  }
-}
+enum _SpeakingState { idle, speaking, paused, finalizing }
