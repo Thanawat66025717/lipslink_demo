@@ -488,11 +488,6 @@ class _ScannerScreenState extends State<ScannerScreen>
     });
 
     final isMouthOpen = mouthOpen >= _mouthOpenThreshold;
-    // 🔎 debug ชั่วคราว: ดูค่า ratio จริงเทียบ threshold ระหว่าง state พูดอยู่
-    // เพื่อหาว่า silence detection ทำไมไม่ trigger — ลบทิ้งได้หลังหาสาเหตุเจอ
-    if (_state == _SpeakingState.speaking || _state == _SpeakingState.paused) {
-      debugPrint('👄 mouthOpen=${mouthOpen.toStringAsFixed(2)} isOpen=$isMouthOpen state=$_state silenceFrames=$_consecutiveSilenceFrames');
-    }
 
     switch (_state) {
       case _SpeakingState.idle:
@@ -770,7 +765,6 @@ class _ScannerScreenState extends State<ScannerScreen>
                         _buildApiFallbackBanner(),
                         const SizedBox(height: 16),
                       ],
-                      _buildDebugOverlay(),
                       _buildCameraCard(),
                       const SizedBox(height: 24),
                       _buildSpeechBubble(),
@@ -782,29 +776,6 @@ class _ScannerScreenState extends State<ScannerScreen>
               ),
             ],
           ),
-        ),
-      ),
-    );
-  }
-
-  // 🔎 debug ชั่วคราว: โชว์ค่าที่ใช้วินิจฉัยปัญหา mouth-open/frame-collection
-  // บนหน้าจอเลย เพื่อให้ถ่ายภาพส่งดูได้ง่ายกว่าไปหา log ใน terminal — ลบทิ้ง
-  // ได้หลังจบการ debug
-  Widget _buildDebugOverlay() {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          color: Colors.black87,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Text(
-          'DEBUG state=${_state.name} mouthOpen=${_mouthOpenProb.toStringAsFixed(2)} '
-          'silenceFrames=$_consecutiveSilenceFrames speakFrames=$_consecutiveSpeakFrames '
-          'collected=${_collectedLipFrames.length} predicting=$_isPredicting',
-          style: const TextStyle(fontSize: 11, color: Colors.limeAccent, fontFamily: 'monospace'),
         ),
       ),
     );
