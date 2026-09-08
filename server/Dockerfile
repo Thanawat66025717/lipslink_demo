@@ -17,8 +17,20 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Expose port
-EXPOSE 8000
+# Keep every cache inside a directory the container can definitely write to.
+# Hugging Face Spaces runs with a different HOME than a plain Docker host, and
+# torch/HF libraries fall back to writing under HOME on first import.
+ENV HOME=/tmp \
+    TORCH_HOME=/tmp/torch \
+    HF_HOME=/tmp/huggingface \
+    XDG_CACHE_HOME=/tmp/cache
 
-# Run server
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# 7860 is the port Hugging Face Spaces expects by default (see app_port in
+# README.md). Hosts that inject their own $PORT (Render, Cloud Run) still work
+# because the port is read from the environment at start-up.
+ENV PORT=7860
+EXPOSE 7860
+
+# Shell form on purpose — exec form would pass "${PORT}" through literally
+# instead of substituting the environment variable.
+CMD uvicorn app:app --host 0.0.0.0 --port ${PORT:-7860}
