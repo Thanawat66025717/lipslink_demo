@@ -1,11 +1,14 @@
 import 'dart:io';
+import 'dart:convert'; // 🟢 เพิ่มตัวแปลงรูปเป็นตัวอักษร (Base64)
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:go_router/go_router.dart';
 import 'package:image_picker/image_picker.dart';
 import '../../../app/theme/app_theme.dart';
 import '../../../shared/models/user_model.dart';
-import '../../../shared/services/storage_service.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+// ❌ เอา Firebase Storage ออกไปเลย ไม่ต้องง้อแล้วครับ!
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -24,23 +27,111 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _loadUser() async {
-    final user = await StorageService.getCurrentUser();
-    if (mounted) setState(() => _user = user);
+    final userAuth = FirebaseAuth.instance.currentUser;
+    
+    if (userAuth != null) {
+      try {
+        DocumentSnapshot doc = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(userAuth.uid)
+            .get();
+
+        if (doc.exists && mounted) {
+          final data = doc.data() as Map<String, dynamic>;
+          setState(() {
+            _user = UserModel(
+              id: userAuth.uid, 
+              email: data['email'] ?? data['username'] ?? '', 
+              name: data['name'] ?? userAuth.displayName ?? 'ไม่มีชื่อ',
+              phone: data['phone'] ?? '',
+              dateOfBirth: data['dateOfBirth'] != null ? DateTime.parse(data['dateOfBirth']) : null,
+              profileImagePath: data['profileImagePath'],
+              createdAt: data['createdAt'] != null 
+                  ? (data['createdAt'] as Timestamp).toDate() 
+                  : DateTime.now(), 
+            );
+          });
+        } else {
+          if (mounted) {
+            setState(() {
+              _user = UserModel(
+                id: userAuth.uid,
+                email: userAuth.email ?? '',
+                name: userAuth.displayName ?? 'ไม่พบข้อมูลในระบบ',
+                phone: 'ยังไม่ได้ระบุ',
+                createdAt: DateTime.now(),
+              );
+            });
+          }
+        }
+      } catch (e) {
+        if (mounted) {
+          setState(() {
+            _user = UserModel(
+              id: userAuth.uid,
+              email: userAuth.email ?? 'Error',
+              name: 'เกิดข้อผิดพลาดในการโหลดข้อมูล',
+              phone: '',
+              createdAt: DateTime.now(),
+            );
+          });
+        }
+      }
+    }
   }
 
   Future<void> _pickImage() async {
     final picker = ImagePicker();
     final picked = await picker.pickImage(
-      source: ImageSource.gallery, maxWidth: 512, maxHeight: 512, imageQuality: 85,
+      source: ImageSource.gallery, 
+      maxWidth: 512, 
+      maxHeight: 512, 
+      imageQuality: 70, // 🟢 บีบอัดเพิ่มอีกนิด เพื่อให้ข้อความสั้นลง โหลดไวขึ้น
     );
-    if (picked == null || _user == null) return;
-    await StorageService.updateUser(_user!.copyWith(profileImagePath: picked.path));
-    await _loadUser();
+    
+    if (picked == null) return; 
+
+    final userAuth = FirebaseAuth.instance.currentUser;
+    if (userAuth != null) {
+      try {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('กำลังอัปเดตรูปภาพ...⏳'), duration: Duration(seconds: 2)),
+          );
+        }
+
+        // 🟢 1. อ่านรูปภาพออกมาเป็นข้อมูลดิบ (Bytes)
+        final bytes = await picked.readAsBytes();
+
+        // 🟢 2. แปลงรูปภาพเป็นรหัสข้อความ (Base64 String)
+        String base64Image = base64Encode(bytes);
+
+        // 🟢 3. บันทึกข้อความรูปลง Firestore ตรงๆ เลย
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(userAuth.uid)
+            .update({'profileImagePath': base64Image});
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('อัปเดตรูปโปรไฟล์สำเร็จ! ✅'), backgroundColor: Colors.green),
+          );
+        }
+        
+        await _loadUser(); 
+
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('❌ เกิดข้อผิดพลาด: $e'), backgroundColor: AppTheme.error),
+          );
+        }
+      }
+    }
   }
 
   Future<void> _openSettings() async {
     await context.push('/profile/settings');
-    // Reload user when returning from settings in case they edited info
     _loadUser();
   }
 
@@ -62,9 +153,25 @@ class _ProfileScreenState extends State<ProfileScreen> {
         );
       },
     );
+
     if (picked != null && picked != _user?.dateOfBirth && _user != null) {
-      await StorageService.updateUser(_user!.copyWith(dateOfBirth: picked));
-      await _loadUser();
+      final userAuth = FirebaseAuth.instance.currentUser; 
+      if (userAuth != null) {
+        try {
+          await FirebaseFirestore.instance
+              .collection('users')
+              .doc(userAuth.uid)
+              .update({'dateOfBirth': picked.toIso8601String()});
+
+          await _loadUser();
+        } catch (e) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('❌ เกิดข้อผิดพลาด: $e'), backgroundColor: AppTheme.error),
+            );
+          }
+        }
+      }
     }
   }
 
@@ -72,7 +179,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     if (date == null) return 'ยังไม่ได้ระบุ';
     final day = date.day.toString().padLeft(2, '0');
     final month = date.month.toString().padLeft(2, '0');
-    final year = date.year + 543; // Convert to Buddhist Era
+    final year = date.year + 543;
     return '$day/$month/$year';
   }
 
@@ -90,13 +197,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
           child: SingleChildScrollView(
             child: Column(
               children: [
-                // ── Header ──────────────────────────────────────────────────
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const SizedBox(width: 24), // Spacer
+                      const SizedBox(width: 24),
                       const Text(
                         'Profile',
                         style: TextStyle(
@@ -111,10 +217,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     ],
                   ),
                 ),
-
                 const SizedBox(height: 24),
-
-                // ── Avatar ──────────────────────────────────────────────────
                 Stack(
                   alignment: Alignment.center,
                   children: [
@@ -124,7 +227,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         width: 100, height: 100,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
-                          border: Border.all(color: const Color(0xFFD4AF37), width: 3), // Gold border
+                          border: Border.all(color: const Color(0xFFD4AF37), width: 3),
                           boxShadow: [
                             BoxShadow(
                               color: Colors.black.withOpacity(0.1),
@@ -133,11 +236,15 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           ],
                         ),
                         clipBehavior: Clip.antiAlias,
-                        child: _user!.profileImagePath != null
-                            ? Image.file(File(_user!.profileImagePath!), fit: BoxFit.cover)
+                        
+                        // 🟢 เปลี่ยนวิธีแสดงผลรูป: ถ้าเป็นรหัส Base64 ให้ใช้ Image.memory แปลงกลับมาเป็นรูป
+                        child: (_user!.profileImagePath != null && _user!.profileImagePath!.isNotEmpty)
+                            ? (_user!.profileImagePath!.startsWith('http') 
+                                ? Image.network(_user!.profileImagePath!, fit: BoxFit.cover) 
+                                : Image.memory(base64Decode(_user!.profileImagePath!), fit: BoxFit.cover))
                             : Container(
                                 color: Colors.white,
-                                child: Center(
+                                child: const Center(
                                   child: Icon(Icons.person, size: 50, color: AppTheme.textHint),
                                 ),
                               ),
@@ -159,28 +266,23 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     ),
                   ],
                 ).animate().scale(duration: 400.ms, curve: Curves.elasticOut),
-
                 const SizedBox(height: 40),
-
-                // ── Info Section (Read-only) ─────────────────────────────────
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 24),
                   child: Column(
                     children: [
-                      _buildInfoPill('ชื่อผู้ใช้', _user!.email),
+                      _buildInfoPill('อีเมล', _user!.email),
                       const SizedBox(height: 12),
                       _buildInfoPill('ชื่อ - สกุล', _user!.name),
                       const SizedBox(height: 12),
                       _buildInfoPill('เบอร์โทรศัพท์', _user!.phone),
                       const SizedBox(height: 12),
-                      // Date field with clickable icon
                       _buildInfoPill(
                         'วันเกิด', 
                         _formatDate(_user!.dateOfBirth), 
                         isDate: true,
                         onIconTap: _pickDate,
                       ),
-                      
                       const SizedBox(height: 24),
                     ],
                   ),

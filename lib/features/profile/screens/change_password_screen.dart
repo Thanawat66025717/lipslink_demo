@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:go_router/go_router.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import '../../../app/theme/app_theme.dart';
-import '../../../shared/services/storage_service.dart';
 import '../../../shared/widgets/gradient_button.dart';
 
 class ChangePasswordScreen extends StatefulWidget {
@@ -13,27 +13,92 @@ class ChangePasswordScreen extends StatefulWidget {
 
 class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _oldCtrl = TextEditingController();
+
+  // controllers
+  final _currentCtrl = TextEditingController();
   final _newCtrl = TextEditingController();
   final _confirmCtrl = TextEditingController();
-  final _phoneCtrl = TextEditingController();
-  final _otpCtrl = TextEditingController();
+
+  // state variables
   bool _isLoading = false;
 
+  // ตัวแปรสำหรับซ่อน/แสดงรหัสผ่าน
+  bool _obscureCurrentPass = true;
+  bool _obscureNewPass = true;
+  bool _obscureConfirmPass = true;
+
   @override
-  void dispose() { 
-    _oldCtrl.dispose(); _newCtrl.dispose(); _confirmCtrl.dispose();
-    _phoneCtrl.dispose(); _otpCtrl.dispose();
-    super.dispose(); 
+  void dispose() {
+    _currentCtrl.dispose();
+    _newCtrl.dispose();
+    _confirmCtrl.dispose();
+    super.dispose();
   }
 
-  Future<void> _save() async {
+  // ── ยืนยันรหัสผ่านเดิม แล้วเปลี่ยนรหัสผ่านใหม่ ──
+  Future<void> _changePassword() async {
     if (!_formKey.currentState!.validate()) return;
+
+    if (_newCtrl.text != _confirmCtrl.text) {
+      _showError('รหัสผ่านใหม่ไม่ตรงกัน');
+      return;
+    }
+    if (_newCtrl.text.length < 6) {
+      _showError('รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร');
+      return;
+    }
+    if (_currentCtrl.text == _newCtrl.text) {
+      _showError('รหัสผ่านใหม่ต้องไม่ซ้ำกับรหัสผ่านเดิม');
+      return;
+    }
+
     setState(() => _isLoading = true);
-    // Simulate API delay
-    await Future.delayed(const Duration(milliseconds: 600));
-    // In a real app we'd verify old password and update it. 
-    if (mounted) { setState(() => _isLoading = false); context.pop(); }
+
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null || user.email == null) {
+        _showError('ไม่พบข้อมูลผู้ใช้ กรุณาล็อกอินใหม่');
+        setState(() => _isLoading = false);
+        return;
+      }
+
+      // ยืนยันตัวตนด้วยรหัสผ่านเดิม (Email/Password)
+      final credential = EmailAuthProvider.credential(
+        email: user.email!,
+        password: _currentCtrl.text,
+      );
+      await user.reauthenticateWithCredential(credential);
+
+      // อัปเดตรหัสผ่านใหม่
+      await user.updatePassword(_newCtrl.text);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('เปลี่ยนรหัสผ่านสำเร็จ! ✅'), backgroundColor: Colors.green),
+        );
+        context.pop();
+      }
+    } on FirebaseAuthException catch (e) {
+      if (mounted) setState(() => _isLoading = false);
+      if (e.code == 'wrong-password' || e.code == 'invalid-credential') {
+        _showError('รหัสผ่านเดิมไม่ถูกต้อง');
+      } else if (e.code == 'weak-password') {
+        _showError('รหัสผ่านใหม่ไม่ปลอดภัยเพียงพอ');
+      } else {
+        _showError('เกิดข้อผิดพลาด: ${e.message}');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _isLoading = false);
+      _showError('เกิดข้อผิดพลาด: $e');
+    }
+  }
+
+  void _showError(String msg) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg), backgroundColor: AppTheme.error),
+      );
+    }
   }
 
   @override
@@ -55,7 +120,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                     ),
                     const Expanded(
                       child: Text(
-                        'Reset Password',
+                        'เปลี่ยนรหัสผ่าน',
                         textAlign: TextAlign.center,
                         style: TextStyle(
                           fontSize: 16, fontWeight: FontWeight.w700,
@@ -63,7 +128,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                         ),
                       ),
                     ),
-                    const SizedBox(width: 20), // Balance
+                    const SizedBox(width: 20),
                   ],
                 ),
               ),
@@ -87,79 +152,119 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        _buildField(label: 'รหัสผ่านเดิม', ctrl: _oldCtrl, obscure: true),
-                        const SizedBox(height: 16),
-                        _buildField(label: 'รหัสผ่านใหม่', ctrl: _newCtrl, obscure: true),
-                        const SizedBox(height: 16),
-                        _buildField(label: 'ยืนยันรหัสผ่าน', ctrl: _confirmCtrl, obscure: true),
-                        const SizedBox(height: 16),
-                        
-                        // Phone and OTP row
+
+                        // ── ฟิลด์: รหัสผ่านเดิม ──
                         Row(
                           children: [
                             const SizedBox(
                               width: 80,
-                              child: Text('เบอร์โทรศัพท์', style: TextStyle(fontSize: 10, color: AppTheme.textHint)),
+                              child: Text('รหัสผ่านเดิม', style: TextStyle(fontSize: 10, color: AppTheme.textHint)),
                             ),
                             Expanded(
                               child: TextFormField(
-                                controller: _phoneCtrl,
-                                keyboardType: TextInputType.phone,
+                                controller: _currentCtrl,
+                                obscureText: _obscureCurrentPass,
                                 decoration: InputDecoration(
                                   contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                                   fillColor: AppTheme.inputBg,
+                                  filled: true,
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
+                                  suffixIcon: IconButton(
+                                    icon: Icon(
+                                      _obscureCurrentPass ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+                                      color: AppTheme.textHint,
+                                      size: 18,
+                                    ),
+                                    onPressed: () {
+                                      setState(() => _obscureCurrentPass = !_obscureCurrentPass);
+                                    },
+                                  ),
                                 ),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            GestureDetector(
-                              onTap: () {
-                                // Handle Request OTP
-                              },
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFFFDE8E8), // Light red/orange
-                                  borderRadius: BorderRadius.circular(30),
-                                ),
-                                child: const Center(
-                                  child: Text('รับ OTP', style: TextStyle(fontSize: 11, color: Colors.black87, fontWeight: FontWeight.w600)),
-                                ),
+                                validator: (v) => v!.isEmpty ? '*' : null,
                               ),
                             ),
                           ],
                         ),
-                        
+
                         const SizedBox(height: 16),
-                        
+
+                        // ── ฟิลด์: รหัสผ่านใหม่ ──
                         Row(
                           children: [
-                            const SizedBox(width: 80),
+                            const SizedBox(
+                              width: 80,
+                              child: Text('รหัสผ่านใหม่', style: TextStyle(fontSize: 10, color: AppTheme.textHint)),
+                            ),
                             Expanded(
                               child: TextFormField(
-                                controller: _otpCtrl,
-                                textAlign: TextAlign.center,
+                                controller: _newCtrl,
+                                obscureText: _obscureNewPass,
                                 decoration: InputDecoration(
-                                  hintText: 'รหัส OTP',
                                   contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                                   fillColor: AppTheme.inputBg,
+                                  filled: true,
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
+                                  suffixIcon: IconButton(
+                                    icon: Icon(
+                                      _obscureNewPass ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+                                      color: AppTheme.textHint,
+                                      size: 18,
+                                    ),
+                                    onPressed: () {
+                                      setState(() => _obscureNewPass = !_obscureNewPass);
+                                    },
+                                  ),
                                 ),
+                                validator: (v) => v!.isEmpty ? '*' : null,
                               ),
                             ),
-                            const SizedBox(width: 60), // Balance to keep it somewhat centered or aligned
+                          ],
+                        ),
+
+                        const SizedBox(height: 16),
+
+                        // ── ฟิลด์: ยืนยันรหัสผ่าน ──
+                        Row(
+                          children: [
+                            const SizedBox(
+                              width: 80,
+                              child: Text('ยืนยันรหัสผ่าน', style: TextStyle(fontSize: 10, color: AppTheme.textHint)),
+                            ),
+                            Expanded(
+                              child: TextFormField(
+                                controller: _confirmCtrl,
+                                obscureText: _obscureConfirmPass,
+                                decoration: InputDecoration(
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                                  fillColor: AppTheme.inputBg,
+                                  filled: true,
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
+                                  suffixIcon: IconButton(
+                                    icon: Icon(
+                                      _obscureConfirmPass ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+                                      color: AppTheme.textHint,
+                                      size: 18,
+                                    ),
+                                    onPressed: () {
+                                      setState(() => _obscureConfirmPass = !_obscureConfirmPass);
+                                    },
+                                  ),
+                                ),
+                                validator: (v) => v!.isEmpty ? '*' : null,
+                              ),
+                            ),
                           ],
                         ),
 
                         const SizedBox(height: 40),
-                        
+
                         Center(
                           child: SizedBox(
                             width: 150,
                             child: GradientButton(
-                              label: 'ยืนยัน', 
-                              isLoading: _isLoading, 
-                              onPressed: _save,
-                              isSecondary: true, // Use green button
+                              label: 'ยืนยัน',
+                              isLoading: _isLoading,
+                              onPressed: _changePassword,
                             ).animate(delay: 100.ms).fadeIn(),
                           ),
                         ),
@@ -175,28 +280,4 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
       ),
     ),
   );
-
-  Widget _buildField({required String label, required TextEditingController ctrl, bool obscure = false}) {
-    return Row(
-      children: [
-        SizedBox(
-          width: 80,
-          child: Text(
-            label,
-            style: const TextStyle(fontSize: 10, color: AppTheme.textHint),
-          ),
-        ),
-        Expanded(
-          child: TextFormField(
-            controller: ctrl,
-            obscureText: obscure,
-            decoration: InputDecoration(
-              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              fillColor: AppTheme.inputBg,
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-}
+}

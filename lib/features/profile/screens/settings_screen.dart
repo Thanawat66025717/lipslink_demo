@@ -1,14 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import '../../../app/theme/app_theme.dart';
-import '../../../shared/services/storage_service.dart';
 import '../../../shared/widgets/gradient_button.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
 
   Future<void> _logout(BuildContext context) async {
-    await StorageService.logout();
+    await FirebaseAuth.instance.signOut();
     if (context.mounted) {
       context.go('/login');
     }
@@ -74,6 +74,13 @@ class SettingsScreen extends StatelessWidget {
                         title: 'เปลี่ยนรหัสผ่าน', 
                         icon: Icons.lock_outline,
                         route: '/profile/change-password',
+                      ),
+                      const SizedBox(height: 12),
+                      _buildMenuTile(
+                        context, 
+                        title: 'จัดการการเชื่อมต่อบัญชี', 
+                        icon: Icons.link_rounded,
+                        route: '/profile/link-email',
                       ),
                       const SizedBox(height: 32),
 

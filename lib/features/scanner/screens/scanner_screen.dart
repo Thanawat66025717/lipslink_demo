@@ -16,7 +16,6 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 
 import '../../../app/theme/app_theme.dart';
 import '../../../shared/services/tts_service.dart';
-import '../../../shared/services/storage_service.dart';
 import '../../../shared/services/lip_reading_api_service.dart';
 
 class ScannerScreen extends StatefulWidget {
@@ -127,7 +126,6 @@ class _ScannerScreenState extends State<ScannerScreen>
   late AnimationController _waveCtrl;
 
   // ─── User ─────────────────────────────────────────────────────────────────
-  String _userName = '';
   final _uuid = const Uuid();
 
   @override
@@ -142,7 +140,6 @@ class _ScannerScreenState extends State<ScannerScreen>
       vsync: this,
       duration: const Duration(milliseconds: 1500),
     )..repeat();
-    _loadUser();
     _initCamera();
     _checkApiStatus();
     _apiStatusTimer = Timer.periodic(
@@ -160,11 +157,6 @@ class _ScannerScreenState extends State<ScannerScreen>
       setState(() => _isApiAvailable = available);
       debugPrint(available ? '✅ API Server พร้อมใช้งาน' : '⚠️ API Server ไม่พร้อม — ใช้โหมดสุ่มคำแทน');
     }
-  }
-
-  Future<void> _loadUser() async {
-    final user = await StorageService.getCurrentUser();
-    if (mounted) setState(() => _userName = user?.name.split(' ').first ?? '');
   }
 
   Future<void> _initCamera() async {
@@ -659,6 +651,11 @@ class _ScannerScreenState extends State<ScannerScreen>
       }
     } catch (e) {
       debugPrint('❌ Firebase Error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('❌ บันทึกไม่สำเร็จ: $e'), backgroundColor: AppTheme.error),
+        );
+      }
     }
   }
 

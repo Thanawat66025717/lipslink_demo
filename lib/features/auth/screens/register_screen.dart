@@ -2,8 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:go_router/go_router.dart';
 import '../../../app/theme/app_theme.dart';
-import '../../../shared/services/storage_service.dart';
 import '../../../shared/widgets/gradient_button.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
@@ -15,13 +16,18 @@ class RegisterScreen extends StatefulWidget {
 class _RegisterScreenState extends State<RegisterScreen> {
   final _formKey = GlobalKey<FormState>();
   final _nameCtrl = TextEditingController();
-  final _surnameCtrl = TextEditingController(); // Added surname for UI
-  final _emailCtrl = TextEditingController(); // Using as username
+  final _surnameCtrl = TextEditingController(); 
+  final _emailCtrl = TextEditingController(); 
   final _phoneCtrl = TextEditingController();
   final _passwordCtrl = TextEditingController();
   final _confirmCtrl = TextEditingController();
+  
   bool _isLoading = false;
   String? _errorMessage;
+
+  // 🟢 ตัวแปรสำหรับซ่อน/แสดงรหัสผ่านแยกช่อง
+  bool _obscurePassword = true;
+  bool _obscureConfirm = true;
 
   @override
   void dispose() {
@@ -34,18 +40,55 @@ class _RegisterScreenState extends State<RegisterScreen> {
   Future<void> _register() async {
     if (!_formKey.currentState!.validate()) return;
     setState(() { _isLoading = true; _errorMessage = null; });
-    final ok = await StorageService.register(
-      name: '${_nameCtrl.text.trim()} ${_surnameCtrl.text.trim()}',
-      email: _emailCtrl.text.trim(),
-      phone: _phoneCtrl.text.trim(),
-      password: _passwordCtrl.text,
-    );
-    if (mounted) {
-      setState(() => _isLoading = false);
-      if (ok) {
-        context.go('/scanner');
-      } else {
-        setState(() => _errorMessage = 'เกิดข้อผิดพลาดในการลงทะเบียน');
+
+    try {
+      String email = _emailCtrl.text.trim();
+
+      // 1. สร้างบัญชีบน Firebase Auth
+      UserCredential userCredential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+        email: email,
+        password: _passwordCtrl.text,
+      );
+
+      // 2. อัปเดตชื่อ-สกุลใน Auth
+      String fullName = '${_nameCtrl.text.trim()} ${_surnameCtrl.text.trim()}';
+      await userCredential.user?.updateDisplayName(fullName);
+      
+      // 3. บันทึกข้อมูลลง Firestore (ใช้ UID เป็นชื่อ Document)
+      await FirebaseFirestore.instance.collection('users').doc(userCredential.user!.uid).set({
+        'email': email, 
+        'name': fullName,
+        'phone': _phoneCtrl.text.trim(),
+        'dateOfBirth': null, 
+        'profileImagePath': null,
+        'createdAt': FieldValue.serverTimestamp(), 
+      });
+
+      if (mounted) {
+        setState(() => _isLoading = false);
+        context.go('/scanner'); 
+      }
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          if (e.code == 'email-already-in-use') {
+            _errorMessage = 'อีเมลนี้มีผู้ใช้งานแล้ว'; 
+          } else if (e.code == 'invalid-email') {
+            _errorMessage = 'รูปแบบอีเมลไม่ถูกต้อง';
+          } else if (e.code == 'weak-password') {
+            _errorMessage = 'รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร';
+          } else {
+            _errorMessage = 'เกิดข้อผิดพลาด: ${e.message}';
+          }
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _errorMessage = 'เกิดข้อผิดพลาดที่ไม่รู้จัก: $e';
+        });
       }
     }
   }
@@ -95,12 +138,12 @@ class _RegisterScreenState extends State<RegisterScreen> {
                       ),
                       const SizedBox(height: 32),
 
-                      _buildLabel('ชื่อบัญชีผู้ใช้'),
+                      _buildLabel('email'),
                       const SizedBox(height: 8),
                       _buildTextField(ctrl: _emailCtrl, validator: (v) => v!.isEmpty ? '*' : null),
                       
                       const SizedBox(height: 16),
-
+                      
                       Row(
                         children: [
                           Expanded(
@@ -135,17 +178,27 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
                       const SizedBox(height: 16),
 
+                      // 🟢 ช่องรหัสผ่าน (เพิ่มปุ่มลูกตาเปิด-ปิด)
                       _buildLabel('รหัสผ่าน'),
                       const SizedBox(height: 8),
-                      _buildTextField(ctrl: _passwordCtrl, obscureText: true, validator: (v) => v!.length < 6 ? '*' : null),
+                      _buildTextField(
+                        ctrl: _passwordCtrl, 
+                        obscureText: _obscurePassword,
+                        isPasswordField: true,
+                        onTogglePassword: () => setState(() => _obscurePassword = !_obscurePassword),
+                        validator: (v) => v!.length < 6 ? '*' : null,
+                      ),
 
                       const SizedBox(height: 16),
 
+                      // 🟢 ช่องยืนยันรหัสผ่าน (เพิ่มปุ่มลูกตาเปิด-ปิด)
                       _buildLabel('ยืนยันรหัสผ่าน'),
                       const SizedBox(height: 8),
                       _buildTextField(
                         ctrl: _confirmCtrl, 
-                        obscureText: true, 
+                        obscureText: _obscureConfirm,
+                        isPasswordField: true,
+                        onTogglePassword: () => setState(() => _obscureConfirm = !_obscureConfirm),
                         validator: (v) => (v != _passwordCtrl.text || v!.isEmpty) ? '*' : null
                       ),
 
@@ -179,9 +232,12 @@ class _RegisterScreenState extends State<RegisterScreen> {
         ),
       );
 
+  // 🟢 ปรับแต่งฟังก์ชันสร้าง TextField ให้รองรับปุ่มดูรหัสผ่าน
   Widget _buildTextField({
     required TextEditingController ctrl,
     bool obscureText = false,
+    bool isPasswordField = false,
+    VoidCallback? onTogglePassword,
     TextInputType? keyboardType,
     String? Function(String?)? validator,
   }) {
@@ -190,7 +246,22 @@ class _RegisterScreenState extends State<RegisterScreen> {
       obscureText: obscureText,
       keyboardType: keyboardType,
       validator: validator,
-      // Default theme applied from AppTheme
+      decoration: InputDecoration(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        fillColor: AppTheme.inputBg ?? Colors.grey.shade50,
+        filled: true,
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
+        suffixIcon: isPasswordField
+            ? IconButton(
+                icon: Icon(
+                  obscureText ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+                  size: 20,
+                  color: AppTheme.textHint,
+                ),
+                onPressed: onTogglePassword,
+              )
+            : null,
+      ),
     );
   }
 }
