@@ -52,8 +52,10 @@ class _ScannerScreenState extends State<ScannerScreen>
   // ─── Mouth state ──────────────────────────────────────────────────────────
   double _mouthOpenProb = 0.0;
   bool _faceDetected = false;
-  static const double _mouthOpenThreshold = 0.45;
-  static const double _mouthCloseThreshold = 0.20;
+  // ค่าเริ่มต้นสำหรับ mouth-aspect-ratio (ช่องปาก/ความกว้างปาก) แบบใหม่ —
+  // ปิดปากสนิทควรใกล้ 0, พูด/อ้าปากเบาๆ มักอยู่แถว 0.15-0.3 ค่านี้เป็นค่า
+  // เริ่มต้นที่ต้อง fine-tune ต่อจากค่าจริงที่ debugPrint ออกมา
+  static const double _mouthOpenThreshold = 0.15;
 
   // ─── Speaking state machine ────────────────────────────────────────────────
   _SpeakingState _state = _SpeakingState.idle;
@@ -434,19 +436,30 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 
   double _estimateMouthOpen(Face face) {
-    final bottomMouth = face.landmarks[FaceLandmarkType.bottomMouth];
+    // วัดช่องว่างระหว่างริมฝีปากบน-ล่างจริงๆ (mouth aspect ratio) แทนระยะจาก
+    // จมูกถึงริมฝีปากล่าง — ค่าเดิมมีระยะฐาน (baseline) สูงอยู่แล้วแม้ปิดปากสนิท
+    // (วัดได้ ~0.65 ทั้งที่ threshold เปิดปากตั้งไว้ 0.45) เลยไม่เคยตกลงมาต่ำกว่า
+    // threshold ให้ตรวจจับว่า "หยุดพูดแล้ว" ได้เลย
+    final upperLipBottom = face.contours[FaceContourType.upperLipBottom]?.points;
+    final lowerLipTop = face.contours[FaceContourType.lowerLipTop]?.points;
     final leftMouth = face.landmarks[FaceLandmarkType.leftMouth];
     final rightMouth = face.landmarks[FaceLandmarkType.rightMouth];
 
-    if (bottomMouth != null && leftMouth != null && rightMouth != null) {
+    if (upperLipBottom != null &&
+        upperLipBottom.isNotEmpty &&
+        lowerLipTop != null &&
+        lowerLipTop.isNotEmpty &&
+        leftMouth != null &&
+        rightMouth != null) {
+      final midUpper = upperLipBottom[upperLipBottom.length ~/ 2];
+      final midLower = lowerLipTop[lowerLipTop.length ~/ 2];
+      final gap = (midLower.y - midUpper.y).abs().toDouble();
+
       final mouthWidth = (rightMouth.position.x - leftMouth.position.x).abs();
-      final noseBase = face.landmarks[FaceLandmarkType.noseBase];
-      if (noseBase != null && mouthWidth > 0) {
-        final noseToMouth =
-            (bottomMouth.position.y - noseBase.position.y).abs();
-        final ratio = noseToMouth / (face.boundingBox.height * 0.35);
-        return ratio.clamp(0.0, 1.0);
-      }
+      if (mouthWidth <= 0) return 0.0;
+
+      final ratio = gap / mouthWidth;
+      return ratio.clamp(0.0, 1.0);
     }
     return 0.0;
   }
@@ -462,6 +475,11 @@ class _ScannerScreenState extends State<ScannerScreen>
     });
 
     final isMouthOpen = mouthOpen >= _mouthOpenThreshold;
+    // 🔎 debug ชั่วคราว: ดูค่า ratio จริงเทียบ threshold ระหว่าง state พูดอยู่
+    // เพื่อหาว่า silence detection ทำไมไม่ trigger — ลบทิ้งได้หลังหาสาเหตุเจอ
+    if (_state == _SpeakingState.speaking || _state == _SpeakingState.paused) {
+      debugPrint('👄 mouthOpen=${mouthOpen.toStringAsFixed(2)} isOpen=$isMouthOpen state=$_state silenceFrames=$_consecutiveSilenceFrames');
+    }
 
     switch (_state) {
       case _SpeakingState.idle:
@@ -739,6 +757,7 @@ class _ScannerScreenState extends State<ScannerScreen>
                         _buildApiFallbackBanner(),
                         const SizedBox(height: 16),
                       ],
+                      _buildDebugOverlay(),
                       _buildCameraCard(),
                       const SizedBox(height: 24),
                       _buildSpeechBubble(),
@@ -750,6 +769,29 @@ class _ScannerScreenState extends State<ScannerScreen>
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  // 🔎 debug ชั่วคราว: โชว์ค่าที่ใช้วินิจฉัยปัญหา mouth-open/frame-collection
+  // บนหน้าจอเลย เพื่อให้ถ่ายภาพส่งดูได้ง่ายกว่าไปหา log ใน terminal — ลบทิ้ง
+  // ได้หลังจบการ debug
+  Widget _buildDebugOverlay() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: Colors.black87,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Text(
+          'DEBUG state=${_state.name} mouthOpen=${_mouthOpenProb.toStringAsFixed(2)} '
+          'silenceFrames=$_consecutiveSilenceFrames speakFrames=$_consecutiveSpeakFrames '
+          'collected=${_collectedLipFrames.length} predicting=$_isPredicting',
+          style: const TextStyle(fontSize: 11, color: Colors.limeAccent, fontFamily: 'monospace'),
         ),
       ),
     );
@@ -807,31 +849,39 @@ class _ScannerScreenState extends State<ScannerScreen>
           ],
         ),
         clipBehavior: Clip.antiAlias,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            _cameraReady && _cameraController != null
-                ? CameraPreview(_cameraController!)
-                : Container(
-                    color: const Color(0xFF0D1B2A),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const Icon(
-                          Icons.camera_alt_outlined,
-                          color: Colors.white38,
-                          size: 52,
-                        ),
-                        const SizedBox(height: 12),
-                        const Text(
-                          'กำลังเปิดกล้อง...',
-                          style: TextStyle(color: Colors.white54),
-                        ),
-                      ],
+        child: Transform(
+          alignment: Alignment.center,
+          // กล้องหน้า (selfie) แสดงภาพดิบแบบไม่สลับซ้าย-ขวา ทำให้ดูเหมือน
+          // "กลับด้าน" ผิดธรรมชาติเทียบกับกระจก จึงสลับด้วย scale(-1) ให้เห็น
+          // เหมือนกระจกตามที่คนคุ้นเคย ครอบทั้ง preview และ overlay จุดใบหน้า
+          // ไปด้วยกัน เพื่อให้จุด tracking ยังอยู่ตรงตำแหน่งใบหน้าเหมือนเดิม
+          transform: _isFrontCamera ? Matrix4.diagonal3Values(-1, 1, 1) : Matrix4.identity(),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              _cameraReady && _cameraController != null
+                  ? CameraPreview(_cameraController!)
+                  : Container(
+                      color: const Color(0xFF0D1B2A),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(
+                            Icons.camera_alt_outlined,
+                            color: Colors.white38,
+                            size: 52,
+                          ),
+                          const SizedBox(height: 12),
+                          const Text(
+                            'กำลังเปิดกล้อง...',
+                            style: TextStyle(color: Colors.white54),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-            if (_cameraReady) _buildFaceOverlay(),
-          ],
+              if (_cameraReady) _buildFaceOverlay(),
+            ],
+          ),
         ),
       ),
     );
@@ -1152,16 +1202,13 @@ class _FaceOverlayPainter extends CustomPainter {
     final scaleX = widgetSize.width / imageW;
     final scaleY = widgetSize.height / imageH;
 
-    double left = faceRect.left * scaleX;
-    double top = faceRect.top * scaleY;
-    double right = faceRect.right * scaleX;
-    double bottom = faceRect.bottom * scaleY;
-
-    if (isFrontCamera) {
-      final tempLeft = widgetSize.width - right;
-      right = widgetSize.width - left;
-      left = tempLeft;
-    }
+    // 🟢 ไม่ต้อง flip พิกัดเองแล้ว เพราะ widget แม่ (ScannerScreen) ครอบทั้ง
+    // CameraPreview กับ overlay นี้ไว้ใน Transform เดียวกันสำหรับกล้องหน้า
+    // ถ้า flip ซ้ำที่นี่อีกจะกลายเป็น flip 2 ต่อ จุดจะไปคนละตำแหน่งกับใบหน้า
+    final left = faceRect.left * scaleX;
+    final top = faceRect.top * scaleY;
+    final right = faceRect.right * scaleX;
+    final bottom = faceRect.bottom * scaleY;
 
     return Rect.fromLTRB(left, top, right, bottom);
   }
@@ -1181,12 +1228,10 @@ class _FaceOverlayPainter extends CustomPainter {
     final scaleX = widgetSize.width / imageW;
     final scaleY = widgetSize.height / imageH;
 
-    double x = point.x.toDouble() * scaleX;
-    double y = point.y.toDouble() * scaleY;
-
-    if (isFrontCamera) {
-      x = widgetSize.width - x;
-    }
+    // 🟢 เหตุผลเดียวกับ _getFaceRect — ไม่ flip ที่นี่แล้ว เพราะ Transform
+    // ระดับ widget ด้านนอกจัดการ mirror ให้ทั้ง preview และ overlay พร้อมกัน
+    final x = point.x.toDouble() * scaleX;
+    final y = point.y.toDouble() * scaleY;
 
     return Offset(x, y);
   }
