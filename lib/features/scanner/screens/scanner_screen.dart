@@ -245,7 +245,7 @@ class _ScannerScreenState extends State<ScannerScreen>
 
         // 🟢 เก็บ lip frames ขณะกำลังพูด (สำหรับส่งไป API)
         if (_state == _SpeakingState.speaking && _isApiAvailable && _collectedLipFrames.length < _maxCollectFrames) {
-          _collectLipFrame(image, face);
+          await _collectLipFrame(image, face);
         }
       }
     } catch (e) {
@@ -256,7 +256,7 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 
   /// เก็บภาพปากจาก camera frame โดยครอปจาก face bounding box
-  void _collectLipFrame(CameraImage image, Face face) {
+  Future<void> _collectLipFrame(CameraImage image, Face face) async {
     try {
       // ครอปบริเวณปากจาก face bounding box
       final rect = face.boundingBox;
@@ -288,12 +288,40 @@ class _ScannerScreenState extends State<ScannerScreen>
         }
       }
 
-      // Encode เป็น PNG bytes สำหรับส่งไป API
-      // สร้าง simple grayscale image data
-      _collectedLipFrames.add(croppedBytes);
+      // Encode เป็น PNG bytes จริงๆ ก่อนส่งไป API — เซิร์ฟเวอร์ถอดรหัสด้วย
+      // cv2.imdecode/PIL ซึ่งต้องการไฟล์ภาพที่ encode แล้ว ส่ง raw pixel bytes
+      // ตรงๆ แบบเดิมจะถอดรหัสไม่ออกและทำให้ prediction ล้มเหลวเงียบๆ
+      final pngBytes = await _encodeGrayscalePng(croppedBytes, cropW, cropH);
+      _collectedLipFrames.add(pngBytes);
     } catch (e) {
       debugPrint('Lip frame collection error: $e');
     }
+  }
+
+  /// แปลง grayscale bytes (1 byte/pixel) เป็นไฟล์ PNG จริง
+  Future<Uint8List> _encodeGrayscalePng(
+      Uint8List grayscale, int width, int height) async {
+    final rgba = Uint8List(width * height * 4);
+    for (int i = 0; i < grayscale.length; i++) {
+      final v = grayscale[i];
+      rgba[i * 4] = v;
+      rgba[i * 4 + 1] = v;
+      rgba[i * 4 + 2] = v;
+      rgba[i * 4 + 3] = 255;
+    }
+
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+      rgba,
+      width,
+      height,
+      ui.PixelFormat.rgba8888,
+      completer.complete,
+    );
+    final image = await completer.future;
+    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+    return byteData!.buffer.asUint8List();
   }
 
   InputImage? _buildInputImage(CameraImage image, CameraDescription camera) {
