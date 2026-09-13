@@ -36,8 +36,11 @@ class _ScannerScreenState extends State<ScannerScreen>
   // ─── ML Kit ───────────────────────────────────────────────────────────────
   final FaceDetector _faceDetector = FaceDetector(
     options: FaceDetectorOptions(
-      enableClassification: true, 
+      enableClassification: true,
       enableLandmarks: true,
+      // ต้องเปิดไว้ เพราะ _estimateMouthOpen วัดช่องว่างริมฝีปากจากจุด contour
+      // ถ้าปิดจะตรวจไม่เจอว่าอ้าปาก แล้วระบบจะไม่เริ่มบันทึกเลย แลกกับที่มันกิน
+      // เวลาราวครึ่งหนึ่งของงานต่อเฟรมทั้งหมด
       enableContours: true,
       performanceMode: FaceDetectorMode.fast,
     ),
@@ -45,13 +48,12 @@ class _ScannerScreenState extends State<ScannerScreen>
   bool _isProcessingFrame = false;
 
   // ─── Face Overlay ─────────────────────────────────────────────────────────
-  List<Face> _detectedFaces = [];
-  Size? _imageSize;
-  InputImageRotation? _imageRotation;
+  // ข้อมูลชุดนี้เปลี่ยนทุกเฟรมกล้อง แต่มีแค่ overlay ที่ใช้ จึงเก็บไว้ใน
+  // ValueNotifier เพื่อให้วาดใหม่เฉพาะ overlay ไม่ลาก setState ทั้งหน้าจอ
+  final ValueNotifier<_FaceOverlayData> _overlayData =
+      ValueNotifier(const _FaceOverlayData());
 
   // ─── Mouth state ──────────────────────────────────────────────────────────
-  double _mouthOpenProb = 0.0;
-  bool _faceDetected = false;
   // ค่าเริ่มต้นสำหรับ mouth-aspect-ratio (ช่องปาก/ความกว้างปาก) แบบใหม่ —
   // ปิดปากสนิทควรใกล้ 0, พูด/อ้าปากเบาๆ มักอยู่แถว 0.15-0.3 ค่านี้เป็นค่า
   // เริ่มต้นที่ต้อง fine-tune ต่อจากค่าจริงที่ debugPrint ออกมา
@@ -76,6 +78,12 @@ class _ScannerScreenState extends State<ScannerScreen>
   List<Uint8List> _collectedLipFrames = [];
   bool _isApiAvailable = false;
   bool _isPredicting = false;
+
+  // ทำนายผลระหว่างที่ยังพูดอยู่ทุกๆ เท่านี้เฟรม แล้วอัปเดตข้อความทันที
+  // ผู้ใช้จึงเห็นผลคืบหน้าไปเรื่อยๆ แทนที่จะจ้องจอว่างจนกว่าจะพูดจบ
+  static const int _partialPredictEveryFrames = 6;
+  int _framesAtLastPartial = 0;
+  Future<void>? _partialInFlight;
   Timer? _apiStatusTimer;
   static const Duration _apiStatusRecheckInterval = Duration(seconds: 20);
   // จำนวน frames สูงสุดที่เก็บต่อการพูด 1 รอบ
@@ -185,7 +193,10 @@ class _ScannerScreenState extends State<ScannerScreen>
 
     final controller = CameraController(
       _cameras[index],
-      ResolutionPreset.medium,
+      // ทุกเฟรมต้องถูกแปลง YUV เป็น NV21 ด้วยลูปวนทีละพิกเซลใน Dart ก่อนส่งให้
+      // ML Kit ต้นทุนจึงแปรผันตรงกับจำนวนพิกเซล ลดความละเอียดลงหนึ่งขั้นทำให้
+      // ประมวลผลได้ถี่ขึ้นมาก ซึ่งสำคัญกว่าความคมชัดสำหรับการครอปภาพปาก
+      ResolutionPreset.low,
       enableAudio: false,
       imageFormatGroup: defaultTargetPlatform == TargetPlatform.android
           ? ImageFormatGroup.yuv420
@@ -236,13 +247,13 @@ class _ScannerScreenState extends State<ScannerScreen>
         return;
       }
 
-      // 🟢 เก็บข้อมูลใบหน้าสำหรับวาด Overlay
+      // 🟢 เก็บข้อมูลใบหน้าสำหรับวาด Overlay (ไม่ setState — ดู _overlayData)
       final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation) ?? InputImageRotation.rotation0deg;
-      setState(() {
-        _detectedFaces = faces;
-        _imageSize = Size(image.width.toDouble(), image.height.toDouble());
-        _imageRotation = rotation;
-      });
+      _overlayData.value = _overlayData.value.copyWith(
+        faces: faces,
+        imageSize: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+      );
 
       if (faces.isEmpty) {
         _updateMouthState(0.0, faceDetected: false);
@@ -260,6 +271,8 @@ class _ScannerScreenState extends State<ScannerScreen>
           // ที่เกินมาจะไม่ถูกเก็บต่ออยู่ดี ไม่มีประโยชน์ที่จะรอเฉยๆ)
           if (_collectedLipFrames.length >= _maxCollectFrames) {
             _finalizeUtterance();
+          } else {
+            _maybePredictPartial();
           }
         }
       }
@@ -481,11 +494,14 @@ class _ScannerScreenState extends State<ScannerScreen>
       {required bool faceDetected, bool smiling = false}) {
     if (!mounted) return;
 
-    setState(() {
-      _mouthOpenProb = mouthOpen;
-      _faceDetected = faceDetected;
-      if (smiling) _currentEmotion = 'happy';
-    });
+    // เดิมเป็น setState ทั้งหน้าจอทุกเฟรมกล้อง ทั้งที่ค่าพวกนี้มีแค่ overlay
+    // ที่ใช้ ย้ายมาแจ้งผ่าน notifier ให้วาดใหม่เฉพาะส่วนที่เปลี่ยนจริง
+    if (smiling) _currentEmotion = 'happy';
+    _overlayData.value = _overlayData.value.copyWith(
+      mouthOpenProb: mouthOpen,
+      faceDetected: faceDetected,
+      isSpeaking: _state == _SpeakingState.speaking,
+    );
 
     final isMouthOpen = mouthOpen >= _mouthOpenThreshold;
 
@@ -530,6 +546,7 @@ class _ScannerScreenState extends State<ScannerScreen>
 
     // 🟢 เคลียร์ frames ที่เก็บไว้
     _collectedLipFrames = [];
+    _framesAtLastPartial = 0;
 
     if (!_isApiAvailable) {
       // Fallback: ใช้คำสุ่มเมื่อ API ไม่พร้อม
@@ -575,6 +592,46 @@ class _ScannerScreenState extends State<ScannerScreen>
     await tts.speakWord(word, emotion: _currentEmotion);
   }
 
+  /// ยิง prediction ระหว่างพูดเป็นระยะ เพื่อให้ข้อความทยอยขึ้นระหว่างที่ยัง
+  /// พูดอยู่ ไม่ต้องรอจนพูดจบ
+  void _maybePredictPartial() {
+    if (_isPredicting) return;
+    if (_collectedLipFrames.length - _framesAtLastPartial <
+        _partialPredictEveryFrames) {
+      return;
+    }
+    _framesAtLastPartial = _collectedLipFrames.length;
+    _partialInFlight = _predictPartial();
+  }
+
+  Future<void> _predictPartial() async {
+    if (_isPredicting) return;
+    _isPredicting = true;
+
+    // สำเนา ณ ขณะนี้ เพราะรายการจริงยังโตต่อระหว่างที่รอผลอยู่
+    final snapshot = List<Uint8List>.of(_collectedLipFrames);
+
+    try {
+      final result = await LipReadingApiService.predictFromFrames(
+        snapshot,
+        model: 'model1',
+      );
+
+      // แสดงเฉพาะตอนที่ยังพูดอยู่ ถ้าจบไปแล้วปล่อยให้ผลสุดท้ายเป็นตัวตัดสิน
+      if (mounted &&
+          result != null &&
+          result.text.isNotEmpty &&
+          _state == _SpeakingState.speaking) {
+        setState(() => _words = [result.text]);
+      }
+    } catch (e) {
+      // ผลระหว่างทางพลาดได้ ไม่ต้องรบกวนผู้ใช้ เดี๋ยวรอบหน้าหรือผลสุดท้ายก็มาแทน
+      debugPrint('partial prediction skipped: $e');
+    } finally {
+      _isPredicting = false;
+    }
+  }
+
   void _onSilenceDetected() {
     if (_state != _SpeakingState.speaking) return;
     setState(() => _state = _SpeakingState.paused);
@@ -611,11 +668,17 @@ class _ScannerScreenState extends State<ScannerScreen>
 
   /// 🟢 ส่ง lip frames ไป API แล้วรับข้อความกลับมา
   Future<void> _predictWithApi() async {
-    if (_isPredicting) return;
+    // รอผลระหว่างทางที่อาจกำลังวิ่งอยู่ให้จบก่อน ไม่งั้นรอบสุดท้ายจะถูกข้าม
+    // เพราะติด _isPredicting แล้วประโยคนั้นจะจบลงด้วยผลที่ยังไม่สมบูรณ์
+    await _partialInFlight;
+    if (!mounted || _isPredicting) return;
+
     setState(() {
       _isPredicting = true;
       _state = _SpeakingState.finalizing;
-      _words = ['กำลังอ่านปาก...'];
+      // ถ้ามีผลระหว่างทางขึ้นอยู่แล้ว คงไว้ให้ผู้ใช้อ่านต่อระหว่างรอผลสุดท้าย
+      // ดีกว่าล้างทิ้งแล้วโชว์ข้อความรอซึ่งเหมือนถอยหลัง
+      if (_words.isEmpty) _words = ['กำลังอ่านปาก...'];
     });
 
     try {
@@ -728,6 +791,7 @@ class _ScannerScreenState extends State<ScannerScreen>
     _wordTimer?.cancel();
     _silenceTimer?.cancel();
     _apiStatusTimer?.cancel();
+    _overlayData.dispose();
     _pulseCtrl.dispose();
     _waveCtrl.dispose();
     _cameraController?.stopImageStream();
@@ -872,22 +936,32 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 
   Widget _buildFaceOverlay() {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        return CustomPaint(
-          size: Size(constraints.maxWidth, constraints.maxHeight),
-          painter: _FaceOverlayPainter(
-            faces: _detectedFaces,
-            imageSize: _imageSize ?? const Size(480, 640),
-            rotation: _imageRotation ?? InputImageRotation.rotation0deg,
-            canvasSize: Size(constraints.maxWidth, constraints.maxHeight),
-            isFrontCamera: _isFrontCamera,
-            isSpeaking: _state == _SpeakingState.speaking,
-            faceDetected: _faceDetected,
-            mouthOpenProb: _mouthOpenProb,
-          ),
-        );
-      },
+    // ฟังการเปลี่ยนแปลงผ่าน ValueNotifier + RepaintBoundary แทนการ setState
+    // ทั้งหน้าจอทุกเฟรมกล้อง ข้อมูลชุดนี้มีแค่ overlay ที่ใช้ จึงไม่มีเหตุผล
+    // ให้ทั้งจอวาดใหม่ตามไปด้วยในอัตราเดียวกับกล้อง
+    return RepaintBoundary(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          return ValueListenableBuilder<_FaceOverlayData>(
+            valueListenable: _overlayData,
+            builder: (context, data, _) {
+              return CustomPaint(
+                size: Size(constraints.maxWidth, constraints.maxHeight),
+                painter: _FaceOverlayPainter(
+                  faces: data.faces,
+                  imageSize: data.imageSize ?? const Size(480, 640),
+                  rotation: data.rotation ?? InputImageRotation.rotation0deg,
+                  canvasSize: Size(constraints.maxWidth, constraints.maxHeight),
+                  isFrontCamera: _isFrontCamera,
+                  isSpeaking: data.isSpeaking,
+                  faceDetected: data.faceDetected,
+                  mouthOpenProb: data.mouthOpenProb,
+                ),
+              );
+            },
+          );
+        },
+      ),
     );
   }
 
@@ -1026,6 +1100,44 @@ class _ScannerScreenState extends State<ScannerScreen>
           ],
         ),
       ],
+    );
+  }
+}
+
+/// ข้อมูลที่ overlay ใช้วาด อัปเดตทุกเฟรมกล้องผ่าน ValueNotifier แทนการ
+/// setState ทั้งหน้าจอ
+class _FaceOverlayData {
+  final List<Face> faces;
+  final Size? imageSize;
+  final InputImageRotation? rotation;
+  final bool faceDetected;
+  final bool isSpeaking;
+  final double mouthOpenProb;
+
+  const _FaceOverlayData({
+    this.faces = const [],
+    this.imageSize,
+    this.rotation,
+    this.faceDetected = false,
+    this.isSpeaking = false,
+    this.mouthOpenProb = 0.0,
+  });
+
+  _FaceOverlayData copyWith({
+    List<Face>? faces,
+    Size? imageSize,
+    InputImageRotation? rotation,
+    bool? faceDetected,
+    bool? isSpeaking,
+    double? mouthOpenProb,
+  }) {
+    return _FaceOverlayData(
+      faces: faces ?? this.faces,
+      imageSize: imageSize ?? this.imageSize,
+      rotation: rotation ?? this.rotation,
+      faceDetected: faceDetected ?? this.faceDetected,
+      isSpeaking: isSpeaking ?? this.isSpeaking,
+      mouthOpenProb: mouthOpenProb ?? this.mouthOpenProb,
     );
   }
 }

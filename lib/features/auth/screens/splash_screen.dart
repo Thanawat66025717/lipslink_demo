@@ -3,6 +3,7 @@ import 'package:flutter_animate/flutter_animate.dart';
 import 'package:go_router/go_router.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../../../app/theme/app_theme.dart';
+import '../../../shared/services/onboarding_prefs.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -20,13 +21,17 @@ class _SplashScreenState extends State<SplashScreen> {
 
   Future<void> _checkAuth() async {
     await Future.delayed(const Duration(seconds: 2));
-    if (mounted) {
-      if (FirebaseAuth.instance.currentUser != null) {
-        context.go('/scanner');
-      } else {
-        context.go('/login');
-      }
+
+    // ผู้ใช้ที่ล็อกอินค้างอยู่ถือว่าผ่านหน้าแนะนำมาแล้ว จึงเช็คสถานะล็อกอินก่อน
+    // ไม่งั้นคนที่เคยลบข้อมูลแอปแล้วล็อกอินใหม่จะโดนหน้าแนะนำคั่นทุกครั้ง
+    if (FirebaseAuth.instance.currentUser != null) {
+      if (mounted) context.go('/scanner');
+      return;
     }
+
+    final seenOnboarding = await OnboardingPrefs.hasSeen();
+    if (!mounted) return;
+    context.go(seenOnboarding ? '/login' : '/onboarding');
   }
 
   @override

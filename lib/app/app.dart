@@ -2,14 +2,17 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../features/auth/screens/splash_screen.dart';
+import '../features/onboarding/screens/onboarding_screen.dart';
 import '../features/auth/screens/login_screen.dart';
 import '../features/auth/screens/register_screen.dart';
+import '../features/auth/screens/forgot_password_screen.dart'; // 🟢 1. อย่าลืม Import ไฟล์นี้เข้ามาด้วยนะครับ
 import '../features/scanner/screens/scanner_screen.dart';
 import '../features/history/screens/history_screen.dart';
 import '../features/profile/screens/profile_screen.dart';
 import '../features/profile/screens/edit_name_screen.dart';
 import '../features/profile/screens/edit_phone_screen.dart';
 import '../features/profile/screens/change_password_screen.dart';
+import '../features/profile/screens/link_email_screen.dart';
 import '../shared/widgets/main_shell.dart';
 import 'theme/app_theme.dart';
 import '../features/profile/screens/settings_screen.dart';
@@ -22,12 +25,21 @@ final _router = GoRouter(
       builder: (context, state) => const SplashScreen(),
     ),
     GoRoute(
+      path: '/onboarding',
+      builder: (context, state) => const OnboardingScreen(),
+    ),
+    GoRoute(
       path: '/login',
       builder: (context, state) => const LoginScreen(),
     ),
     GoRoute(
       path: '/register',
       builder: (context, state) => const RegisterScreen(),
+    ),
+    // 🟢 2. เพิ่มเส้นทางไปหน้าลืมรหัสผ่านตรงนี้ครับ
+    GoRoute(
+      path: '/forgot-password',
+      builder: (context, state) => const ForgotPasswordScreen(),
     ),
     ShellRoute(
       builder: (context, state, child) => MainShell(child: child),
@@ -61,6 +73,10 @@ final _router = GoRouter(
     GoRoute(
       path: '/profile/change-password',
       builder: (context, state) => const ChangePasswordScreen(),
+    ),
+    GoRoute(
+      path: '/profile/link-email',
+      builder: (context, state) => const LinkEmailScreen(),
     ),
   ],
 );
