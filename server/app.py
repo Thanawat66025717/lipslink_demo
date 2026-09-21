@@ -25,7 +25,8 @@ from PIL import Image
 
 from lip_model import (
     load_model_1, load_model_2,
-    ctc_greedy_decode, LipReadingModel, DualStreamModel
+    ctc_greedy_decode, LipReadingModel, DualStreamModel,
+    load_vocalip_word_model,
 )
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
@@ -81,6 +82,33 @@ async def load_models():
     else:
         print(f"⚠️ Model 2 not found: {model2_path}")
 
+    # VocaLip Thai: ทำนายเป็น "คำ" จาก 44 คำที่เทรนไว้ (คนละตระกูลกับสองตัวบน
+    # ซึ่งเป็น CTC ระดับตัวอักษร) จึงแยก endpoint และแยก preprocessing กันคนละชุด
+    word_path = os.path.join(MODEL_DIR, "03_vocalip_44words_deployment.pt")
+    if os.path.exists(word_path):
+        try:
+            model, id_to_word, meta = load_vocalip_word_model(word_path)
+            models["vocalip_word"] = {
+                "model": model,
+                "id_to_word": id_to_word,
+                "meta": meta,
+                "type": "word_classifier",
+            }
+            cfg = meta["config"]
+            acc = meta.get("test_metrics", {}).get("accuracy")
+            print(
+                f"✅ VocaLip word model loaded: {word_path} "
+                f"({meta['num_classes']} words, {cfg.get('frames')} frames, "
+                f"roi={cfg.get('roi')}, test acc={acc:.2%})"
+                if acc is not None else
+                f"✅ VocaLip word model loaded: {word_path}"
+            )
+            print(f"   ⚠️ scope: {meta.get('scope')}")
+        except Exception as e:
+            print(f"❌ Failed to load VocaLip word model: {e}")
+    else:
+        print(f"⚠️ VocaLip word model not found: {word_path}")
+
     if not models:
         print("⚠️ No models loaded! Place .pt files in server/models/")
 
@@ -101,6 +129,33 @@ class PredictResponse(BaseModel):
     model_used: str
     processing_time_ms: float
     num_frames: int
+
+
+class WordPredictRequest(BaseModel):
+    """Request body สำหรับโมเดลทำนายคำ (VocaLip 44 คำ)
+
+    frames: ภาพปาก base64 (PNG/JPEG) เรียงตามเวลา — ส่งมากี่เฟรมก็ได้
+            เซิร์ฟเวอร์จะเลือกให้เหลือ 16 เฟรมกระจายเท่าๆ กันเอง
+    """
+    frames: List[str]
+    top_k: Optional[int] = 3
+
+
+class WordCandidate(BaseModel):
+    word: str
+    confidence: float
+
+
+class WordPredictResponse(BaseModel):
+    word: str
+    confidence: float
+    top_k: List[WordCandidate]
+    processing_time_ms: float
+    num_frames_received: int
+    num_frames_used: int
+    # ต่ำกว่าเกณฑ์นี้ควรถือว่า "ไม่แน่ใจ" — โมเดลบังคับเลือก 1 ใน 44 คำเสมอ
+    # แม้ผู้ใช้จะพูดคำนอกชุด จึงต้องให้ client ตัดสินใจเองได้
+    low_confidence: bool
 
 
 # ─── Helper Functions ─────────────────────────────────────────────────────────
@@ -136,6 +191,29 @@ async def root():
     }
 
 
+def _model_summary(info: dict) -> dict:
+    """สรุปข้อมูลโมเดลแบบรองรับทั้งตระกูล CTC (itos) และตระกูลทำนายคำ
+
+    สองตระกูลเก็บ metadata คนละคีย์กัน จึงต้องแยกอ่าน ไม่งั้น endpoint
+    ที่วนทุกโมเดลจะพังทันทีที่มีโมเดลตระกูลใหม่โผล่มา
+    """
+    if "itos" in info:
+        return {
+            "type": info["type"],
+            "config": info.get("config", {}),
+            "vocab_size": len(info["itos"]),
+        }
+
+    meta = info.get("meta", {})
+    return {
+        "type": info["type"],
+        "config": meta.get("config", {}),
+        "vocab_size": meta.get("num_classes"),
+        "test_metrics": meta.get("test_metrics", {}),
+        "scope": meta.get("scope"),
+    }
+
+
 @app.get("/health")
 async def health_check():
     """เช็กสถานะ Server"""
@@ -143,26 +221,15 @@ async def health_check():
         "status": "healthy",
         "models_loaded": list(models.keys()),
         "model_details": {
-            name: {
-                "type": info["type"],
-                "vocab_size": len(info["itos"]),
-            }
-            for name, info in models.items()
-        }
+            name: _model_summary(info) for name, info in models.items()
+        },
     }
 
 
 @app.get("/models")
 async def list_models():
     """ดูรายชื่อโมเดลที่มี"""
-    return {
-        name: {
-            "type": info["type"],
-            "config": info["config"],
-            "vocab_size": len(info["itos"]),
-        }
-        for name, info in models.items()
-    }
+    return {name: _model_summary(info) for name, info in models.items()}
 
 
 @app.post("/predict", response_model=PredictResponse)
@@ -254,6 +321,129 @@ async def predict(request: PredictRequest):
         processing_time_ms=round(elapsed, 2),
         num_frames=len(request.frames),
     )
+
+
+# ─── VocaLip 44-word prediction ──────────────────────────────────────────────
+
+def _decode_color_frame(b64_string: str, roi: int) -> np.ndarray:
+    """base64 -> ภาพสี RGB ขนาด roi x roi (uint8, HWC)"""
+    img_bytes = base64.b64decode(b64_string)
+    img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)   # ได้ BGR จาก OpenCV
+
+    if img is None:
+        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img = np.array(pil_img)                        # RGB อยู่แล้ว
+    else:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)     # ทำให้เป็น RGB เสมอ
+
+    if img.shape[:2] != (roi, roi):
+        img = cv2.resize(img, (roi, roi))
+
+    return img
+
+
+def _pick_evenly(items: list, n: int) -> list:
+    """เลือก n รายการกระจายเท่าๆ กันจาก items
+
+    ถ้ามีน้อยกว่า n จะวนซ้ำเฟรมสุดท้ายให้ครบ เพราะโมเดลรับความยาวคงที่
+    """
+    if len(items) == n:
+        return items
+    if len(items) > n:
+        idx = np.linspace(0, len(items) - 1, n).round().astype(int)
+        return [items[i] for i in idx]
+    return items + [items[-1]] * (n - len(items))
+
+
+@app.post("/predict_word", response_model=WordPredictResponse)
+async def predict_word(request: WordPredictRequest):
+    """ทำนายว่าเป็นคำใดใน 44 คำ จากลำดับภาพปาก
+
+    ต่างจาก /predict ตรงที่ตัวนี้คืน "คำเดียว" ต่อหนึ่งคลิป ไม่ใช่ข้อความอิสระ
+    """
+    start_time = time.time()
+
+    entry = models.get("vocalip_word")
+    if entry is None:
+        raise HTTPException(
+            status_code=503,
+            detail="โมเดลทำนายคำยังไม่ถูกโหลด ตรวจสอบไฟล์ใน server/models/",
+        )
+
+    if not request.frames:
+        raise HTTPException(status_code=400, detail="ไม่มี frames ส่งมา")
+
+    model = entry["model"]
+    id_to_word = entry["id_to_word"]
+    meta = entry["meta"]
+    cfg = meta["config"]
+    pre = meta["preprocessing"]
+
+    want_frames = int(cfg.get("frames", 16))
+    roi = int(cfg.get("roi", 112))
+    mean = np.array(pre.get("mean", [0.485, 0.456, 0.406]), dtype=np.float32)
+    std = np.array(pre.get("std", [0.229, 0.224, 0.225]), dtype=np.float32)
+
+    try:
+        selected = _pick_evenly(list(request.frames), want_frames)
+        frames = np.stack([_decode_color_frame(b, roi) for b in selected])
+
+        # ลำดับขั้นตรงตาม Notebook 03 CELL 2: /255 -> (x-mean)/std -> THWC->TCHW
+        x = frames.astype(np.float32) / 255.0
+        x = (x - mean[None, None, None, :]) / std[None, None, None, :]
+        x = np.ascontiguousarray(np.transpose(x, (0, 3, 1, 2)), dtype=np.float32)
+
+        tensor = torch.from_numpy(x).unsqueeze(0)      # [1, T, C, H, W]
+
+        with torch.no_grad():
+            probs = torch.softmax(model(tensor), dim=1)[0]
+
+        k = max(1, min(int(request.top_k or 3), len(id_to_word)))
+        top_p, top_i = torch.topk(probs, k)
+
+        candidates = [
+            WordCandidate(
+                word=id_to_word.get(int(i), f"<{int(i)}>"),
+                confidence=round(float(p), 4),
+            )
+            for p, i in zip(top_p, top_i)
+        ]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+
+    elapsed = (time.time() - start_time) * 1000
+
+    return WordPredictResponse(
+        word=candidates[0].word,
+        confidence=candidates[0].confidence,
+        top_k=candidates,
+        processing_time_ms=round(elapsed, 2),
+        num_frames_received=len(request.frames),
+        num_frames_used=want_frames,
+        low_confidence=candidates[0].confidence < 0.35,
+    )
+
+
+@app.get("/word_model_info")
+async def word_model_info():
+    """ข้อมูลโมเดลทำนายคำ รวมรายการคำทั้งหมดและผลวัดที่ผู้เทรนบันทึกมา"""
+    entry = models.get("vocalip_word")
+    if entry is None:
+        raise HTTPException(status_code=503, detail="โมเดลทำนายคำยังไม่ถูกโหลด")
+
+    meta = entry["meta"]
+    return {
+        "format": meta["format"],
+        "config": meta["config"],
+        "preprocessing": meta["preprocessing"],
+        "test_metrics": meta["test_metrics"],
+        "scope": meta["scope"],
+        "words": [entry["id_to_word"][i] for i in sorted(entry["id_to_word"])],
+    }
 
 
 # ─── Run Server ───────────────────────────────────────────────────────────────
