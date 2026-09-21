@@ -326,21 +326,28 @@ async def predict(request: PredictRequest):
 # ─── VocaLip 44-word prediction ──────────────────────────────────────────────
 
 def _decode_color_frame(b64_string: str, roi: int) -> np.ndarray:
-    """base64 -> ภาพสี RGB ขนาด roi x roi (uint8, HWC)"""
+    """base64 -> ภาพสีเรียงช่องแบบ BGR ขนาด roi x roi (uint8, HWC)
+
+    ⚠️ ต้องเป็น BGR ไม่ใช่ RGB — training cache สร้างด้วย OpenCV ซึ่งให้ BGR
+    และตอนเทรนไม่มีการแปลงเป็น RGB ก่อนเข้าโมเดล (ยืนยันจากผู้เทรนแล้ว)
+    ถ้าสลับเป็น RGB ตรงนี้ โมเดลจะเห็นผิวหน้าเป็นโทนฟ้าและทำนายเพี้ยน
+    โดยไม่มี error ฟ้อง
+
+    cv2.imdecode คืนค่าเป็น BGR อยู่แล้ว จึงใช้ได้ตรงๆ ไม่ต้องแปลง
+    ส่วนทาง PIL ได้ RGB มา ต้องกลับลำดับช่องเองให้เป็น BGR
+    """
     img_bytes = base64.b64decode(b64_string)
     img_array = np.frombuffer(img_bytes, dtype=np.uint8)
-    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)   # ได้ BGR จาก OpenCV
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)   # BGR ตามที่โมเดลต้องการ
 
     if img is None:
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = np.array(pil_img)                        # RGB อยู่แล้ว
-    else:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)     # ทำให้เป็น RGB เสมอ
+        img = np.array(pil_img)[:, :, ::-1]            # RGB -> BGR
 
     if img.shape[:2] != (roi, roi):
         img = cv2.resize(img, (roi, roi))
 
-    return img
+    return np.ascontiguousarray(img)
 
 
 def _pick_evenly(items: list, n: int) -> list:
@@ -440,6 +447,9 @@ async def word_model_info():
         "format": meta["format"],
         "config": meta["config"],
         "preprocessing": meta["preprocessing"],
+        # checkpoint เขียน channel_order ไว้กำกวมว่า "cached order; no channel
+        # swap" จึงระบุค่าที่ยืนยันกับผู้เทรนแล้วไว้ตรงนี้ให้ client อ่านได้ชัด
+        "channel_order_resolved": "BGR",
         "test_metrics": meta["test_metrics"],
         "scope": meta["scope"],
         "words": [entry["id_to_word"][i] for i in sorted(entry["id_to_word"])],
