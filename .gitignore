@@ -43,3 +43,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# ภาพ mouth ROI ที่ VOCALIP_DEBUG=1 เซฟไว้ให้ดูตอนไล่ปัญหา ไม่ใช่ซอร์ส
+/server/debug/

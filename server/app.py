@@ -49,6 +49,12 @@ app.add_middleware(
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 
+# โหมด debug สำหรับไล่ตรวจ pipeline ทีละขั้น เปิดด้วย VOCALIP_DEBUG=1
+# หรือส่ง {"debug": true} มากับ request เป็นครั้งๆ ก็ได้
+# เปิดแล้วจะ print ทุกขั้นลง console และเซฟภาพ mouth ROI ล่าสุดไว้ดู
+DEBUG_DEFAULT = os.getenv("VOCALIP_DEBUG", "0").lower() not in ("0", "", "false", "no")
+DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug")
+
 # Global model storage
 models = {}
 
@@ -139,6 +145,8 @@ class WordPredictRequest(BaseModel):
     """
     frames: List[str]
     top_k: Optional[int] = 3
+    # เปิด debug เฉพาะ request นี้ โดยไม่ต้องรีสตาร์ท server ด้วย VOCALIP_DEBUG
+    debug: Optional[bool] = None
 
 
 class WordCandidate(BaseModel):
@@ -155,7 +163,10 @@ class WordPredictResponse(BaseModel):
     num_frames_used: int
     # ต่ำกว่าเกณฑ์นี้ควรถือว่า "ไม่แน่ใจ" — โมเดลบังคับเลือก 1 ใน 44 คำเสมอ
     # แม้ผู้ใช้จะพูดคำนอกชุด จึงต้องให้ client ตัดสินใจเองได้
+    # หมายเหตุ: เป็นแค่ "ธง" ไม่ได้กรองผลทิ้ง — top_k คืนค่าดิบเสมอ
     low_confidence: bool
+    # มีค่าเฉพาะตอนเปิด debug — รูปร่าง/ช่วงค่าของ tensor ในแต่ละขั้น
+    debug: Optional[dict] = None
 
 
 # ─── Helper Functions ─────────────────────────────────────────────────────────
@@ -350,6 +361,28 @@ def _decode_color_frame(b64_string: str, roi: int) -> np.ndarray:
     return np.ascontiguousarray(img)
 
 
+def _save_debug_frames(frames: np.ndarray) -> dict:
+    """เซฟภาพ mouth ROI ที่ server ได้รับจริงลง server/debug/ ไว้เปิดดูด้วยตา
+
+    frames เป็น BGR อยู่แล้ว และ cv2.imwrite ก็คาดหวัง BGR พอดี จึงเขียนตรงๆ ได้
+    ถ้าเปิดไฟล์แล้วเห็นผิวหน้าเป็นโทนฟ้า แปลว่า client ส่งช่องสีสลับมา
+    """
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    paths = {}
+
+    last = frames[-1]
+    last_path = os.path.join(DEBUG_DIR, "last_mouth_roi.png")
+    cv2.imwrite(last_path, last)
+    paths["last_roi"] = last_path
+
+    # เรียงทุกเฟรมต่อกันเป็นแถบเดียว จะได้เห็นว่าปากขยับจริงตลอดคลิปหรือนิ่งค้าง
+    strip_path = os.path.join(DEBUG_DIR, "frames_strip.png")
+    cv2.imwrite(strip_path, np.concatenate(list(frames), axis=1))
+    paths["strip"] = strip_path
+
+    return paths
+
+
 def _pick_evenly(items: list, n: int) -> list:
     """เลือก n รายการกระจายเท่าๆ กันจาก items
 
@@ -392,6 +425,9 @@ async def predict_word(request: WordPredictRequest):
     mean = np.array(pre.get("mean", [0.485, 0.456, 0.406]), dtype=np.float32)
     std = np.array(pre.get("std", [0.229, 0.224, 0.225]), dtype=np.float32)
 
+    debug = DEBUG_DEFAULT if request.debug is None else bool(request.debug)
+    dbg: dict = {}
+
     try:
         selected = _pick_evenly(list(request.frames), want_frames)
         frames = np.stack([_decode_color_frame(b, roi) for b in selected])
@@ -404,7 +440,8 @@ async def predict_word(request: WordPredictRequest):
         tensor = torch.from_numpy(x).unsqueeze(0)      # [1, T, C, H, W]
 
         with torch.no_grad():
-            probs = torch.softmax(model(tensor), dim=1)[0]
+            logits = model(tensor)
+            probs = torch.softmax(logits, dim=1)[0]
 
         k = max(1, min(int(request.top_k or 3), len(id_to_word)))
         top_p, top_i = torch.topk(probs, k)
@@ -416,6 +453,24 @@ async def predict_word(request: WordPredictRequest):
             )
             for p, i in zip(top_p, top_i)
         ]
+
+        if debug:
+            dbg = {
+                "buffer": f"{len(request.frames)} received -> {want_frames} used",
+                "roi_shape": list(frames.shape[1:]),
+                "roi_uint8_range": [int(frames.min()), int(frames.max())],
+                "channel_order": "BGR",
+                "input_tensor_shape": list(tensor.shape),
+                "input_tensor_dtype": str(tensor.dtype),
+                "input_tensor_min": round(float(tensor.min()), 4),
+                "input_tensor_max": round(float(tensor.max()), 4),
+                "logits_shape": list(logits.shape),
+                "logits_min": round(float(logits.min()), 4),
+                "logits_max": round(float(logits.max()), 4),
+                "vocab_size": len(id_to_word),
+            }
+            dbg["debug_images"] = _save_debug_frames(frames)
+            _print_word_debug(dbg, candidates)
 
     except HTTPException:
         raise
@@ -432,7 +487,27 @@ async def predict_word(request: WordPredictRequest):
         num_frames_received=len(request.frames),
         num_frames_used=want_frames,
         low_confidence=candidates[0].confidence < 0.35,
+        debug=dbg or None,
     )
+
+
+def _print_word_debug(dbg: dict, candidates: List[WordCandidate]) -> None:
+    """พิมพ์สรุปแต่ละขั้นของ pipeline ลง console ให้ไล่ดูได้ทีละบรรทัด"""
+    print("─" * 52, flush=True)
+    print(f"Buffer: {dbg['buffer']}", flush=True)
+    print(f"ROI: {tuple(dbg['roi_shape'])} {dbg['channel_order']} "
+          f"uint8 range {dbg['roi_uint8_range']}", flush=True)
+    print(f"Input tensor: {tuple(dbg['input_tensor_shape'])} "
+          f"{dbg['input_tensor_dtype']} "
+          f"min={dbg['input_tensor_min']} max={dbg['input_tensor_max']}",
+          flush=True)
+    print(f"Logits: {tuple(dbg['logits_shape'])} "
+          f"min={dbg['logits_min']} max={dbg['logits_max']}", flush=True)
+    print(f"\nTOP-{len(candidates)}", flush=True)
+    for rank, c in enumerate(candidates, 1):
+        print(f"{rank}. {c.word}\t{c.confidence:.4f}", flush=True)
+    print(f"\nsaved: {dbg['debug_images']['last_roi']}", flush=True)
+    print("─" * 52, flush=True)
 
 
 @app.get("/word_model_info")

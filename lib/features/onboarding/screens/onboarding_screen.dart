@@ -2,9 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../../app/theme/app_theme.dart';
-import '../../../shared/services/onboarding_prefs.dart';
 
-/// หน้าแนะนำการใช้งานที่แสดงครั้งแรกก่อนเข้าสู่ระบบ
+/// หน้าแนะนำการใช้งานที่แสดงก่อนเข้าสู่ระบบทุกครั้งที่ยังไม่ได้ล็อกอิน
 class OnboardingScreen extends StatefulWidget {
   const OnboardingScreen({super.key});
 
@@ -56,10 +55,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     super.dispose();
   }
 
-  Future<void> _finish() async {
-    await OnboardingPrefs.markSeen();
-    if (mounted) context.go('/login');
-  }
+  void _finish() => context.go('/login');
 
   void _next() {
     if (_isLastPage) {
