@@ -59,6 +59,16 @@ class _ScannerScreenState extends State<ScannerScreen>
   // เริ่มต้นที่ต้อง fine-tune ต่อจากค่าจริงที่ debugPrint ออกมา
   static const double _mouthOpenThreshold = 0.15;
 
+  // ─── Mouth ROI (ต้องตรงกับตอนเทรนโมเดล 44 คำ) ─────────────────────────────
+  // ครอปกว้างกว่ากรอบริมฝีปากจริง 2.4 เท่า ตามค่า MOUTH_SCALE ที่ใช้ตอนสร้าง
+  // training cache ครอปแคบหรือกว้างกว่านี้ โมเดลจะเห็นบริบทไม่เท่าที่เคยเห็นมา
+  static const double _mouthScale = 2.4;
+  // ขนาดภาพที่โมเดลรับ (checkpoint ระบุ roi=112) ย่อตั้งแต่ฝั่งแอปเลย
+  // จะได้ไม่ต้องส่งภาพใหญ่เกินจำเป็นข้ามเน็ตไปให้ server ย่อทีหลัง
+  static const int _roiSize = 112;
+  // จำนวนเฟรมที่โมเดลรับต่อหนึ่งคลิป (checkpoint ระบุ frames=16)
+  static const int _modelFrameCount = 16;
+
   // ─── Speaking state machine ────────────────────────────────────────────────
   _SpeakingState _state = _SpeakingState.idle;
   Timer? _silenceTimer; 
@@ -265,7 +275,9 @@ class _ScannerScreenState extends State<ScannerScreen>
 
         // 🟢 เก็บ lip frames ขณะกำลังพูด (สำหรับส่งไป API)
         if (_state == _SpeakingState.speaking && _isApiAvailable && _collectedLipFrames.length < _maxCollectFrames) {
-          await _collectLipFrame(image, face);
+          // ส่ง sensorOrientation ไปด้วย เพราะพิกัดที่ ML Kit คืนมาอยู่ในภาพ
+          // ที่หมุนตั้งแล้ว แต่พิกเซลที่ต้องอ่านอยู่ในบัฟเฟอร์ที่ยังไม่หมุน
+          await _collectLipFrame(image, face, camera.sensorOrientation);
           // ถ้าเก็บครบ cap แล้วแต่ยังพูดต่อไม่หยุด ส่งเท่าที่มีไปประมวลผลเลย
           // ดีกว่าปล่อยให้ผู้ใช้รอเก้อจนกว่าจะตรวจพบว่าหยุดพูดจริง (frame ส่วน
           // ที่เกินมาจะไม่ถูกเก็บต่ออยู่ดี ไม่มีประโยชน์ที่จะรอเฉยๆ)
@@ -283,61 +295,180 @@ class _ScannerScreenState extends State<ScannerScreen>
     _isProcessingFrame = false;
   }
 
-  /// เก็บภาพปากจาก camera frame โดยครอปจาก face bounding box
-  Future<void> _collectLipFrame(CameraImage image, Face face) async {
+  /// เก็บภาพปาก 1 เฟรมเป็นภาพสี 112x112 ตรงตามที่โมเดล 44 คำถูกเทรนมา
+  ///
+  /// สามอย่างที่ต่างจากเวอร์ชันก่อน และจำเป็นทั้งสามอย่าง:
+  /// - ครอปจากเส้น contour ริมฝีปากจริงคูณ 2.4 ไม่ใช่เดาสัดส่วนจาก bounding box
+  /// - แปลงพิกัดจากระบบของ ML Kit (ภาพที่หมุนตั้งแล้ว) กลับมาที่บัฟเฟอร์ดิบ
+  ///   ก่อนอ่านพิกเซล ของเดิมอ่านตรงๆ จึงครอปผิดตำแหน่งไปคนละที่เมื่อกล้อง
+  ///   หมุน 90/270 องศา ซึ่งเป็นค่าปกติของกล้องหน้าบนมือถือ
+  /// - อ่าน U/V ด้วย ไม่ใช่แค่ Y เพราะโมเดลรับภาพ 3 ช่องสี ของเดิมส่งขาวดำไป
+  ///   ซึ่ง server รันผ่านโดยไม่ error แต่โมเดลตอบมั่ว
+  Future<void> _collectLipFrame(
+      CameraImage image, Face face, int rotationDegrees) async {
     try {
-      // ครอปบริเวณปากจาก face bounding box
-      final rect = face.boundingBox;
-      // ปากอยู่ประมาณครึ่งล่างของใบหน้า
-      final mouthTop = rect.top + rect.height * 0.6;
-      final mouthHeight = rect.height * 0.4;
-      final mouthLeft = rect.left + rect.width * 0.1;
-      final mouthWidth = rect.width * 0.8;
+      final roi = _mouthRoiRect(face);
+      if (roi == null) return;
 
-      // แปลง NV21 เป็น grayscale (Y channel เท่านั้น)
-      final int width = image.width;
-      final int height = image.height;
-      final yPlane = image.planes[0].bytes;
+      final rgba = _cropMouthToRgba(image, roi, rotationDegrees);
+      if (rgba == null) return;
 
-      // Crop mouth region จาก Y plane
-      final int cropX = mouthLeft.toInt().clamp(0, width - 1);
-      final int cropY = mouthTop.toInt().clamp(0, height - 1);
-      final int cropW = mouthWidth.toInt().clamp(1, width - cropX);
-      final int cropH = mouthHeight.toInt().clamp(1, height - cropY);
-
-      // สร้าง cropped image bytes
-      final croppedBytes = Uint8List(cropW * cropH);
-      for (int y = 0; y < cropH; y++) {
-        for (int x = 0; x < cropW; x++) {
-          final srcIdx = (cropY + y) * image.planes[0].bytesPerRow + (cropX + x);
-          if (srcIdx < yPlane.length) {
-            croppedBytes[y * cropW + x] = yPlane[srcIdx];
-          }
-        }
-      }
-
-      // Encode เป็น PNG bytes จริงๆ ก่อนส่งไป API — เซิร์ฟเวอร์ถอดรหัสด้วย
-      // cv2.imdecode/PIL ซึ่งต้องการไฟล์ภาพที่ encode แล้ว ส่ง raw pixel bytes
-      // ตรงๆ แบบเดิมจะถอดรหัสไม่ออกและทำให้ prediction ล้มเหลวเงียบๆ
-      final pngBytes = await _encodeGrayscalePng(croppedBytes, cropW, cropH);
-      _collectedLipFrames.add(pngBytes);
+      // ต้อง encode เป็นไฟล์ PNG จริง — server ถอดรหัสด้วย cv2.imdecode/PIL
+      // ซึ่งอ่าน raw pixel bytes ไม่ออก
+      _collectedLipFrames.add(await _encodeRgbaPng(rgba, _roiSize, _roiSize));
     } catch (e) {
       debugPrint('Lip frame collection error: $e');
     }
   }
 
-  /// แปลง grayscale bytes (1 byte/pixel) เป็นไฟล์ PNG จริง
-  Future<Uint8List> _encodeGrayscalePng(
-      Uint8List grayscale, int width, int height) async {
-    final rgba = Uint8List(width * height * 4);
-    for (int i = 0; i < grayscale.length; i++) {
-      final v = grayscale[i];
-      rgba[i * 4] = v;
-      rgba[i * 4 + 1] = v;
-      rgba[i * 4 + 2] = v;
-      rgba[i * 4 + 3] = 255;
+  /// กรอบจัตุรัสรอบปาก ในระบบพิกัดเดียวกับที่ ML Kit คืนค่ามา
+  /// (คือภาพที่หมุนตั้งขึ้นแล้ว ไม่ใช่บัฟเฟอร์ดิบของกล้อง)
+  ///
+  /// คืน null เมื่อหาตำแหน่งปากไม่ได้ ซึ่งแปลว่าเฟรมนั้นข้ามไปดีกว่าเดา
+  Rect? _mouthRoiRect(Face face) {
+    double? minX, minY, maxX, maxY;
+
+    void include(num x, num y) {
+      minX = (minX == null || x < minX!) ? x.toDouble() : minX;
+      maxX = (maxX == null || x > maxX!) ? x.toDouble() : maxX;
+      minY = (minY == null || y < minY!) ? y.toDouble() : minY;
+      maxY = (maxY == null || y > maxY!) ? y.toDouble() : maxY;
     }
 
+    for (final type in const [
+      FaceContourType.upperLipTop,
+      FaceContourType.upperLipBottom,
+      FaceContourType.lowerLipTop,
+      FaceContourType.lowerLipBottom,
+    ]) {
+      final points = face.contours[type]?.points;
+      if (points == null) continue;
+      for (final p in points) {
+        include(p.x, p.y);
+      }
+    }
+
+    // เผื่อบางเฟรมที่ ML Kit ให้ contour ไม่ครบ ยังพอถูไถด้วยจุดมุมปากได้
+    if (minX == null) {
+      for (final type in const [
+        FaceLandmarkType.leftMouth,
+        FaceLandmarkType.rightMouth,
+        FaceLandmarkType.bottomMouth,
+      ]) {
+        final landmark = face.landmarks[type];
+        if (landmark != null) {
+          include(landmark.position.x, landmark.position.y);
+        }
+      }
+    }
+    if (minX == null) return null;
+
+    // ใช้ด้านที่ยาวกว่าเป็นด้านของจัตุรัส เพราะกรอบปากแบนมาก (กว้าง >> สูง)
+    // ถ้าใช้ความสูงจะได้ครอปที่เล็กจนไม่เหลือบริบทรอบปากเลย
+    final side = max(maxX! - minX!, maxY! - minY!) * _mouthScale;
+    if (side <= 0) return null;
+
+    return Rect.fromCenter(
+      center: Offset((minX! + maxX!) / 2, (minY! + maxY!) / 2),
+      width: side,
+      height: side,
+    );
+  }
+
+  /// ครอปบริเวณปากจากบัฟเฟอร์ YUV420 ของกล้องออกมาเป็น RGBA ขนาด 112x112
+  ///
+  /// สุ่มจุดแบบ nearest-neighbour ทีละพิกเซลปลายทาง จึงไม่ต้องสร้างภาพสีเต็ม
+  /// เฟรมกลางทาง — เสียเวลาแค่ราว 12,500 พิกเซลต่อเฟรมแทนที่จะเป็นหลักแสน
+  Uint8List? _cropMouthToRgba(
+      CameraImage image, Rect roi, int rotationDegrees) {
+    final planes = image.planes;
+    if (planes.isEmpty) return null;
+
+    final int rawW = image.width;
+    final int rawH = image.height;
+
+    final yBytes = planes[0].bytes;
+    final int yRowStride = planes[0].bytesPerRow;
+    final int yPixelStride = planes[0].bytesPerPixel ?? 1;
+
+    final Uint8List uBytes, vBytes;
+    final int uvRowStride, uvPixelStride, uOffset, vOffset;
+
+    if (planes.length >= 3) {
+      uBytes = planes[1].bytes;
+      vBytes = planes[2].bytes;
+      uvRowStride = planes[1].bytesPerRow;
+      uvPixelStride = planes[1].bytesPerPixel ?? 1;
+      uOffset = 0;
+      vOffset = 0;
+    } else {
+      // บางเครื่องส่ง NV21 มาเป็น plane เดียว: Y ทั้งภาพ แล้วต่อด้วย V,U สลับกัน
+      uBytes = yBytes;
+      vBytes = yBytes;
+      uvRowStride = yRowStride;
+      uvPixelStride = 2;
+      vOffset = rawH * yRowStride;
+      uOffset = vOffset + 1;
+    }
+
+    final out = Uint8List(_roiSize * _roiSize * 4);
+    int o = 0;
+
+    for (int oy = 0; oy < _roiSize; oy++) {
+      final double upY = roi.top + (oy + 0.5) * roi.height / _roiSize;
+      for (int ox = 0; ox < _roiSize; ox++) {
+        final double upX = roi.left + (ox + 0.5) * roi.width / _roiSize;
+
+        // ย้อนการหมุนที่ ML Kit ทำไว้ กลับไปเป็นพิกัดในบัฟเฟอร์ดิบ
+        final int rx, ry;
+        switch (rotationDegrees) {
+          case 90:
+            rx = upY.round();
+            ry = rawH - 1 - upX.round();
+            break;
+          case 180:
+            rx = rawW - 1 - upX.round();
+            ry = rawH - 1 - upY.round();
+            break;
+          case 270:
+            rx = rawW - 1 - upY.round();
+            ry = upX.round();
+            break;
+          default:
+            rx = upX.round();
+            ry = upY.round();
+        }
+
+        final int cx = rx.clamp(0, rawW - 1);
+        final int cy = ry.clamp(0, rawH - 1);
+
+        final int yIdx = cy * yRowStride + cx * yPixelStride;
+        final int uvIdx = (cy >> 1) * uvRowStride + (cx >> 1) * uvPixelStride;
+
+        final int luma = yIdx < yBytes.length ? yBytes[yIdx] : 0;
+        final int uIdx = uOffset + uvIdx;
+        final int vIdx = vOffset + uvIdx;
+        // 128 คือค่ากลางของ chroma = ไม่มีสี ใช้เมื่ออ่านนอกขอบบัฟเฟอร์
+        final int u = (uIdx < uBytes.length ? uBytes[uIdx] : 128) - 128;
+        final int v = (vIdx < vBytes.length ? vBytes[vIdx] : 128) - 128;
+
+        // YUV -> RGB ตามสูตร BT.601 ซึ่งเป็นสูตรที่กล้อง Android ใช้
+        out[o++] = (luma + 1.402 * v).round().clamp(0, 255);
+        out[o++] = (luma - 0.344136 * u - 0.714136 * v).round().clamp(0, 255);
+        out[o++] = (luma + 1.772 * u).round().clamp(0, 255);
+        out[o++] = 255;
+      }
+    }
+
+    return out;
+  }
+
+  /// แปลงพิกเซล RGBA เป็นไฟล์ PNG
+  ///
+  /// สีที่ออกมาต้องถูกต้องตามจริง (ปากแดงต้องออกมาแดง) เพราะฝั่ง server
+  /// ถอดด้วย cv2.imdecode ซึ่งคืนค่าเป็น BGR พอดีกับที่โมเดลถูกเทรนมา
+  Future<Uint8List> _encodeRgbaPng(
+      Uint8List rgba, int width, int height) async {
     final completer = Completer<ui.Image>();
     ui.decodeImageFromPixels(
       rgba,
@@ -350,6 +481,19 @@ class _ScannerScreenState extends State<ScannerScreen>
     final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
     image.dispose();
     return byteData!.buffer.asUint8List();
+  }
+
+  /// เลือกเฟรมให้เหลือ 16 เฟรมกระจายเท่าๆ กันก่อนส่ง
+  ///
+  /// server เลือกให้เองได้อยู่แล้ว แต่ทำตรงนี้ก่อนช่วยลดขนาดที่ต้องส่งข้ามเน็ต
+  /// ลงเกินครึ่งเมื่อเก็บมาเต็ม 40 เฟรม ซึ่งมีผลกับเวลารอโดยตรง
+  List<Uint8List> _framesForModel(List<Uint8List> frames) {
+    if (frames.length <= _modelFrameCount) return frames;
+    final step = (frames.length - 1) / (_modelFrameCount - 1);
+    return List.generate(
+      _modelFrameCount,
+      (i) => frames[(i * step).round()],
+    );
   }
 
   InputImage? _buildInputImage(CameraImage image, CameraDescription camera) {
@@ -609,20 +753,17 @@ class _ScannerScreenState extends State<ScannerScreen>
     _isPredicting = true;
 
     // สำเนา ณ ขณะนี้ เพราะรายการจริงยังโตต่อระหว่างที่รอผลอยู่
-    final snapshot = List<Uint8List>.of(_collectedLipFrames);
+    final snapshot = _framesForModel(List<Uint8List>.of(_collectedLipFrames));
 
     try {
-      final result = await LipReadingApiService.predictFromFrames(
-        snapshot,
-        model: 'model1',
-      );
+      final result = await LipReadingApiService.predictWord(snapshot);
 
       // แสดงเฉพาะตอนที่ยังพูดอยู่ ถ้าจบไปแล้วปล่อยให้ผลสุดท้ายเป็นตัวตัดสิน
       if (mounted &&
           result != null &&
-          result.text.isNotEmpty &&
+          result.word.isNotEmpty &&
           _state == _SpeakingState.speaking) {
-        setState(() => _words = [result.text]);
+        setState(() => _words = [result.word]);
       }
     } catch (e) {
       // ผลระหว่างทางพลาดได้ ไม่ต้องรบกวนผู้ใช้ เดี๋ยวรอบหน้าหรือผลสุดท้ายก็มาแทน
@@ -682,20 +823,20 @@ class _ScannerScreenState extends State<ScannerScreen>
     });
 
     try {
-      final result = await LipReadingApiService.predictFromFrames(
-        _collectedLipFrames,
-        model: 'model1',
+      final result = await LipReadingApiService.predictWord(
+        _framesForModel(_collectedLipFrames),
       );
 
-      if (result != null && result.text.isNotEmpty && mounted) {
+      if (result != null && result.word.isNotEmpty && mounted) {
         setState(() {
-          _words = [result.text];
+          _words = [result.word];
         });
 
         // TTS อ่านออกเสียง
-        await _tts.speak(result.text, emotion: _currentEmotion);
+        await _tts.speak(result.word, emotion: _currentEmotion);
 
-        debugPrint('🔮 AI Prediction: ${result.text} (confidence: ${(result.confidence * 100).toStringAsFixed(1)}%, time: ${result.processingTimeMs}ms)');
+        // ดู top-3 เต็มๆ ได้ที่ console ของ server เมื่อเปิด VOCALIP_DEBUG=1
+        debugPrint('🔮 $result${result.lowConfidence ? ' [low confidence]' : ''}');
       } else {
         // Fallback ถ้า API ไม่ส่งผลลัพธ์
         if (mounted) {
