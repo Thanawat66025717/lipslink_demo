@@ -120,6 +120,10 @@ class WordPrediction {
   /// ฝั่งแอปเป็นคนตัดสินใจเองว่าจะแสดงผลนั้นหรือไม่
   final bool lowConfidence;
 
+  /// เกณฑ์ที่ server ใช้ตัดสิน [lowConfidence] ปรับได้ที่ server ด้วย
+  /// ตัวแปรสภาพแวดล้อม VOCALIP_MIN_CONFIDENCE
+  final double minConfidence;
+
   const WordPrediction({
     required this.word,
     required this.confidence,
@@ -127,6 +131,7 @@ class WordPrediction {
     required this.processingTimeMs,
     required this.framesUsed,
     required this.lowConfidence,
+    required this.minConfidence,
   });
 
   factory WordPrediction.fromJson(Map<String, dynamic> json) => WordPrediction(
@@ -140,10 +145,11 @@ class WordPrediction {
             (json['processing_time_ms'] as num?)?.toDouble() ?? 0.0,
         framesUsed: (json['num_frames_used'] as num?)?.toInt() ?? 0,
         lowConfidence: json['low_confidence'] as bool? ?? false,
+        minConfidence: (json['min_confidence'] as num?)?.toDouble() ?? 0.0,
       );
 
   @override
   String toString() =>
       '${topK.join(' / ')} (${processingTimeMs.toStringAsFixed(0)}ms, '
-      '$framesUsed frames)';
+      '$framesUsed frames, threshold ${minConfidence.toStringAsFixed(2)})';
 }

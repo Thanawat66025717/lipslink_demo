@@ -55,6 +55,17 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 DEBUG_DEFAULT = os.getenv("VOCALIP_DEBUG", "0").lower() not in ("0", "", "false", "no")
 DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug")
 
+# ต่ำกว่านี้ถือว่าเดาคำไม่ได้ แล้วแอปจะขึ้นข้อความให้ลองใหม่แทนการโชว์คำมั่วๆ
+#
+# ตั้งผ่าน VOCALIP_MIN_CONFIDENCE ได้ เพราะค่าที่เหมาะต้องจูนจากของจริง และ
+# แก้ที่นี่แล้วรีสตาร์ท server พอ ไม่ต้อง build APK ใหม่ทุกครั้งที่อยากลองค่าใหม่
+#
+# วัดจริงกับ checkpoint ตัวปัจจุบัน: ปากจริงได้ราว 0.23-0.28 ส่วนภาพขยะ
+# (ดำ/ขาว/noise) ได้ 0.16-0.24 — สองช่วงนี้ทับกัน จึงไม่มีค่าไหนที่แยกได้สะอาด
+# ค่า 0.20 เลือกให้ผ่านการพูดจริงเกือบทั้งหมดและกันขยะบางส่วน ถ้าตั้งสูงกว่า
+# ~0.29 แอปจะขึ้นว่าอ่านไม่ได้ทุกครั้ง เพราะโมเดลตัวนี้ไม่เคยมั่นใจถึงขนาดนั้น
+MIN_WORD_CONFIDENCE = float(os.getenv("VOCALIP_MIN_CONFIDENCE", "0.20"))
+
 # Global model storage
 models = {}
 
@@ -165,6 +176,9 @@ class WordPredictResponse(BaseModel):
     # แม้ผู้ใช้จะพูดคำนอกชุด จึงต้องให้ client ตัดสินใจเองได้
     # หมายเหตุ: เป็นแค่ "ธง" ไม่ได้กรองผลทิ้ง — top_k คืนค่าดิบเสมอ
     low_confidence: bool
+    # เกณฑ์ที่ใช้ตัดสิน low_confidence ส่งมาด้วยเพื่อให้ตรวจสอบได้ว่า server
+    # ตั้งไว้เท่าไร โดยไม่ต้องเดาจากฝั่ง client
+    min_confidence: float
     # มีค่าเฉพาะตอนเปิด debug — รูปร่าง/ช่วงค่าของ tensor ในแต่ละขั้น
     debug: Optional[dict] = None
 
@@ -486,7 +500,8 @@ async def predict_word(request: WordPredictRequest):
         processing_time_ms=round(elapsed, 2),
         num_frames_received=len(request.frames),
         num_frames_used=want_frames,
-        low_confidence=candidates[0].confidence < 0.35,
+        low_confidence=candidates[0].confidence < MIN_WORD_CONFIDENCE,
+        min_confidence=MIN_WORD_CONFIDENCE,
         debug=dbg or None,
     )
 

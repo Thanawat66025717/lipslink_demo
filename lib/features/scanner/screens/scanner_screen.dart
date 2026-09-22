@@ -82,6 +82,18 @@ class _ScannerScreenState extends State<ScannerScreen>
   // ─── Output ───────────────────────────────────────────────────────────────
   List<String> _words = [];
   String get _displayText => _words.join(' ');
+
+  // ข้อความที่ขึ้นแทนคำ เมื่อโมเดลเดาได้แต่ไม่มั่นใจพอ โมเดลถูกบังคับให้เลือก
+  // 1 ใน 44 คำเสมอ แม้ผู้ใช้จะพูดคำนอกชุดหรือกล้องจับปากไม่ติด การโชว์คำที่
+  // มันเดามั่วๆ ทำให้ผู้ใช้เข้าใจผิดว่าระบบอ่านได้ ทั้งที่ยังไม่ได้อ่าน
+  static const String _unreadableMessage =
+      'ไม่สามารถประมวลผลได้ (ลองใหม่อีกครั้ง)';
+
+  /// true เมื่อข้อความที่แสดงอยู่เป็นคำที่อ่านได้จริง ไม่ใช่ข้อความแจ้งปัญหา
+  ///
+  /// ใช้คุมปุ่มบันทึก/อ่านออกเสียง จะได้ไม่มีข้อความแจ้งปัญหาหลุดไปอยู่ใน
+  /// ประวัติ หรือถูก TTS อ่านออกมาดังๆ
+  bool _hasWord = false;
   String _currentEmotion = 'neutral';
 
   // ─── AI Lip Reading ────────────────────────────────────────────────────────
@@ -704,6 +716,7 @@ class _ScannerScreenState extends State<ScannerScreen>
     setState(() {
       _state = _SpeakingState.speaking;
       _words = [];
+      _hasWord = false;
     });
 
     if (!_isApiAvailable) {
@@ -759,11 +772,19 @@ class _ScannerScreenState extends State<ScannerScreen>
       final result = await LipReadingApiService.predictWord(snapshot);
 
       // แสดงเฉพาะตอนที่ยังพูดอยู่ ถ้าจบไปแล้วปล่อยให้ผลสุดท้ายเป็นตัวตัดสิน
+      //
+      // ผลระหว่างทางที่ไม่มั่นใจจะเงียบไว้เฉยๆ ไม่ขึ้นข้อความแจ้งปัญหา เพราะ
+      // ตอนพูดยังไม่จบมันเดาไม่ออกเป็นเรื่องปกติ ถ้าขึ้นแล้วหายไปๆ มาๆ ระหว่าง
+      // พูดจะกวนสายตา ปล่อยให้ผลสุดท้ายเป็นคนบอกว่าอ่านไม่ได้จริงหรือเปล่า
       if (mounted &&
           result != null &&
+          !result.lowConfidence &&
           result.word.isNotEmpty &&
           _state == _SpeakingState.speaking) {
-        setState(() => _words = [result.word]);
+        setState(() {
+          _words = [result.word];
+          _hasWord = true;
+        });
       }
     } catch (e) {
       // ผลระหว่างทางพลาดได้ ไม่ต้องรบกวนผู้ใช้ เดี๋ยวรอบหน้าหรือผลสุดท้ายก็มาแทน
@@ -827,29 +848,36 @@ class _ScannerScreenState extends State<ScannerScreen>
         _framesForModel(_collectedLipFrames),
       );
 
-      if (result != null && result.word.isNotEmpty && mounted) {
-        setState(() {
-          _words = [result.word];
-        });
+      // ดู top-3 เต็มๆ ได้ที่ console ของ server เมื่อเปิด VOCALIP_DEBUG=1
+      if (result != null) {
+        debugPrint(
+            '🔮 $result${result.lowConfidence ? ' [low confidence]' : ''}');
+      }
 
-        // TTS อ่านออกเสียง
-        await _tts.speak(result.word, emotion: _currentEmotion);
+      if (!mounted) return;
 
-        // ดู top-3 เต็มๆ ได้ที่ console ของ server เมื่อเปิด VOCALIP_DEBUG=1
-        debugPrint('🔮 $result${result.lowConfidence ? ' [low confidence]' : ''}');
-      } else {
-        // Fallback ถ้า API ไม่ส่งผลลัพธ์
-        if (mounted) {
-          setState(() {
-            _words = ['(ไม่สามารถอ่านได้)'];
-          });
-        }
+      // เดาได้แต่ไม่มั่นใจพอ ให้บอกตรงๆ ว่าอ่านไม่ได้ ดีกว่าโชว์คำที่เดามั่ว
+      // ซึ่งผู้ใช้แยกไม่ออกว่าอันไหนอ่านได้จริง
+      final word = (result != null &&
+              result.word.isNotEmpty &&
+              !result.lowConfidence)
+          ? result.word
+          : null;
+
+      setState(() {
+        _words = [word ?? _unreadableMessage];
+        _hasWord = word != null;
+      });
+
+      if (word != null) {
+        await _tts.speak(word, emotion: _currentEmotion);
       }
     } catch (e) {
       debugPrint('❌ API prediction error: $e');
       if (mounted) {
         setState(() {
-          _words = ['(เกิดข้อผิดพลาด)'];
+          _words = [_unreadableMessage];
+          _hasWord = false;
         });
       }
     } finally {
@@ -865,7 +893,9 @@ class _ScannerScreenState extends State<ScannerScreen>
 
   // ─── Save phrase to Firebase ──────────────────────────────────────────────
   Future<void> _savePhrase() async {
-    if (_displayText.isEmpty) return;
+    // กันไว้อีกชั้นนอกเหนือจากที่ปุ่มปิดไว้ ข้อความแจ้งว่าอ่านไม่ได้ไม่ควร
+    // หลุดลงประวัติไม่ว่าจะถูกเรียกจากทางไหน
+    if (!_hasWord || _displayText.isEmpty) return;
 
     final userAuth = FirebaseAuth.instance.currentUser;
     if (userAuth == null) {
@@ -919,7 +949,7 @@ class _ScannerScreenState extends State<ScannerScreen>
 
   // ─── Replay full sentence ─────────────────────────────────────────────────
   Future<void> _replayFull() async {
-    if (_displayText.isEmpty) return;
+    if (!_hasWord || _displayText.isEmpty) return;
     setState(() => _isTtsSpeaking = true);
     await _tts.speak(_displayText, emotion: _currentEmotion);
     _tts.setOnCompletionHandler(() {
@@ -1127,10 +1157,13 @@ class _ScannerScreenState extends State<ScannerScreen>
       child: hasText
           ? Text(
               _displayText + (_state == _SpeakingState.speaking ? '...' : ''),
-              style: const TextStyle(
-                  fontSize: 16,
-                  color: AppTheme.textPrimary,
-                  fontWeight: FontWeight.w500),
+              // ข้อความแจ้งว่าอ่านไม่ได้ใช้สีจางกว่า จะได้ไม่ดูเหมือนคำที่
+              // อ่านออกมาได้จริง ผู้ใช้แยกออกตั้งแต่เหลือบมอง
+              style: TextStyle(
+                fontSize: _hasWord ? 16 : 14,
+                color: _hasWord ? AppTheme.textPrimary : AppTheme.textHint,
+                fontWeight: _hasWord ? FontWeight.w500 : FontWeight.w400,
+              ),
               textAlign: TextAlign.center,
             )
           : const Text(
@@ -1142,7 +1175,9 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 
   Widget _buildActionRow() {
-    final hasText = _words.isNotEmpty;
+    // ผูกกับ _hasWord ไม่ใช่ "มีข้อความอยู่มั้ย" เพราะข้อความแจ้งว่าอ่านไม่ได้
+    // ก็เป็นข้อความเหมือนกัน แต่ไม่ควรบันทึกลงประวัติหรือให้ TTS อ่านออกเสียง
+    final hasText = _hasWord;
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       crossAxisAlignment: CrossAxisAlignment.end,
