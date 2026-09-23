@@ -69,6 +69,13 @@ class _ScannerScreenState extends State<ScannerScreen>
   // จำนวนเฟรมที่โมเดลรับต่อหนึ่งคลิป (checkpoint ระบุ frames=16)
   static const int _modelFrameCount = 16;
 
+  // ขนาดด้านของกรอบครอป เฉลี่ยแบบถ่วงน้ำหนักตลอดหนึ่งประโยค (null = เริ่มใหม่)
+  //
+  // กรอบดิบที่คำนวณจาก contour ทุกเฟรมมีขนาดแกว่งแรงมาก: มันโตตามตอนอ้าปาก
+  // และกระโดดเป็นเท่าตัวเวลา ML Kit จับ contour พลาดไปเฟรมหนึ่ง ผลคือโมเดล
+  // เห็นภาพซูมเข้าๆ ออกๆ สลับกันภายในคลิปเดียว ซึ่งตอนเทรนไม่มีแบบนั้น
+  double? _roiSideEma;
+
   // ─── Speaking state machine ────────────────────────────────────────────────
   _SpeakingState _state = _SpeakingState.idle;
   Timer? _silenceTimer; 
@@ -377,8 +384,21 @@ class _ScannerScreenState extends State<ScannerScreen>
 
     // ใช้ด้านที่ยาวกว่าเป็นด้านของจัตุรัส เพราะกรอบปากแบนมาก (กว้าง >> สูง)
     // ถ้าใช้ความสูงจะได้ครอปที่เล็กจนไม่เหลือบริบทรอบปากเลย
-    final side = max(maxX! - minX!, maxY! - minY!) * _mouthScale;
-    if (side <= 0) return null;
+    final rawSide = max(maxX! - minX!, maxY! - minY!) * _mouthScale;
+    if (rawSide <= 0) return null;
+
+    // จุดกึ่งกลางยังตามปากทุกเฟรมเหมือนเดิม ปรับให้นิ่งเฉพาะ "ขนาด" เพราะขนาด
+    // คือสิ่งที่กระโดดจนภาพซูมเข้าออก ส่วนตำแหน่งต้องตามหัวที่ขยับอยู่แล้ว
+    final ema = _roiSideEma;
+    final double side;
+    if (ema == null) {
+      side = rawSide;
+    } else {
+      // จำกัดช่วงก่อนเอาไปเฉลี่ย เพื่อไม่ให้เฟรมที่ตรวจพลาดเฟรมเดียวลากขนาด
+      // ของทั้งประโยคตามไปด้วย
+      side = ema * 0.8 + rawSide.clamp(ema * 0.75, ema * 1.33) * 0.2;
+    }
+    _roiSideEma = side;
 
     return Rect.fromCenter(
       center: Offset((minX! + maxX!) / 2, (minY! + maxY!) / 2),
@@ -718,6 +738,9 @@ class _ScannerScreenState extends State<ScannerScreen>
       _words = [];
       _hasWord = false;
     });
+    // เริ่มประโยคใหม่ก็เริ่มวัดขนาดกรอบใหม่ ไม่ลากค่าจากประโยคก่อนมา เพราะ
+    // ผู้ใช้อาจขยับเข้าออกจากกล้องระหว่างนั้น
+    _roiSideEma = null;
 
     if (!_isApiAvailable) {
       _scheduleNextWord();
