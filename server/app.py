@@ -417,19 +417,25 @@ def _roi_size(meta: dict) -> int:
 
 
 def _mouth_motion(frames: np.ndarray) -> float:
-    """ปริมาณการขยับปากตลอดคลิป
+    """ปริมาณการขยับปากตลอดคลิป — สูตรเดียวกับ motion_score() ใน Notebook 05
 
-    นิยาม: ค่าเฉลี่ยของ |เฟรม(t) - เฟรม(t-1)| ทุกพิกเซลทุกช่องสี บนสเกล 0-1
-    (คือหาร 255 แล้ว แต่ยังไม่ normalize ด้วย mean/std)
+    ลำดับสำคัญมาก: เฉลี่ย 3 ช่องสีให้เป็นภาพเทา "ก่อน" แล้วค่อยหาผลต่างระหว่าง
+    เฟรม ถ้าสลับลำดับ (หาผลต่างทีละช่องแล้วค่อยเฉลี่ย) จะได้ค่าสูงกว่าเสมอ
+    เพราะเครื่องหมายลบกันเองไม่ได้ ทำให้เทียบกับ threshold ผิดสเกล
 
-    ⚠️ checkpoint บอกแค่ตัวเลข threshold มา ไม่ได้บอกว่าวัดด้วยสูตรไหน
-    นิยามข้างบนเป็นสิ่งที่ฝั่ง deployment เลือกใช้ และรายงานค่าที่วัดได้กลับไป
-    ใน response ทุกครั้ง เพื่อให้เทียบกับฝั่งเทรนได้ว่าตรงกันหรือไม่
+    แล้วตัดเอาเฉพาะกลางภาพ (แถว 25-80%, คอลัมน์ 12-88%) เพื่อตัดขอบที่เป็น
+    คาง จมูก และพื้นหลัง ซึ่งขยับตามหัวโดยไม่เกี่ยวกับการพูด
     """
     if len(frames) < 2:
         return 0.0
+
     x = frames.astype(np.float32) / 255.0
-    return float(np.abs(np.diff(x, axis=0)).mean())
+    gray = x.mean(-1)                                   # (T, H, W)
+    diff = np.abs(gray[1:] - gray[:-1])
+
+    h, w = gray.shape[1:]
+    diff = diff[:, int(.25 * h):int(.80 * h), int(.12 * w):int(.88 * w)]
+    return float(diff.mean())
 
 
 def _save_debug_frames(frames: np.ndarray) -> dict:
@@ -638,8 +644,11 @@ async def word_model_info():
         "channel_order_resolved": pre.get("cache_channel_order", "BGR"),
         "rejection": meta.get("rejection", {}),
         "motion_gate": meta.get("motion_gate", {}),
-        # นิยามที่ฝั่ง deployment ใช้วัด motion — checkpoint บอกแค่ตัวเลขเกณฑ์
-        "motion_metric": "mean |frame(t) - frame(t-1)| over all pixels, 0-1 scale",
+        # สูตรเดียวกับ motion_score() ใน Notebook 05 CELL 16
+        "motion_metric": (
+            "mean |gray(t) - gray(t-1)| where gray = mean over channels, "
+            "cropped to rows 25-80% and cols 12-88%, 0-1 scale"
+        ),
         "test_metrics": meta.get("test_metrics", {}),
         "scope": meta.get("scope"),
         "words": [entry["id_to_word"][i] for i in sorted(entry["id_to_word"])],

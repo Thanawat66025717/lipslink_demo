@@ -849,12 +849,17 @@ class _ScannerScreenState extends State<ScannerScreen>
       );
 
       // ดู top-3 เต็มๆ ได้ที่ console ของ server เมื่อเปิด VOCALIP_DEBUG=1
-      if (result != null) {
-        debugPrint(
-            '🔮 $result${result.lowConfidence ? ' [low confidence]' : ''}');
-      }
+      if (result != null) debugPrint('🔮 $result');
 
       if (!mounted) return;
+
+      // ปากไม่ได้ขยับจริง (ติดแค่ motion gate) ถือว่ายังไม่มีใครพูดอะไร จึงกลับ
+      // ไปรอเฉยๆ ไม่ขึ้นข้อความว่าอ่านไม่ได้ เพราะไม่มีอะไรให้อ่านตั้งแต่แรก
+      // การขึ้นข้อความตรงนี้จะกลายเป็นเตือนผิดทุกครั้งที่ผู้ใช้แค่ขยับหน้า
+      final idleOnly = result != null &&
+          result.lowConfidence &&
+          result.rejectReasons.length == 1 &&
+          result.rejectReasons.first == 'motion';
 
       // เดาได้แต่ไม่มั่นใจพอ ให้บอกตรงๆ ว่าอ่านไม่ได้ ดีกว่าโชว์คำที่เดามั่ว
       // ซึ่งผู้ใช้แยกไม่ออกว่าอันไหนอ่านได้จริง
@@ -865,7 +870,9 @@ class _ScannerScreenState extends State<ScannerScreen>
           : null;
 
       setState(() {
-        _words = [word ?? _unreadableMessage];
+        _words = word != null
+            ? [word]
+            : (idleOnly ? <String>[] : [_unreadableMessage]);
         _hasWord = word != null;
       });
 
