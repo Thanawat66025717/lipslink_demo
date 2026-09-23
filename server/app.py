@@ -26,7 +26,7 @@ from PIL import Image
 from lip_model import (
     load_model_1, load_model_2,
     ctc_greedy_decode, LipReadingModel, DualStreamModel,
-    load_vocalip_word_model,
+    load_vocalip_word_model, load_vocalip_real_model,
 )
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
@@ -55,16 +55,15 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 DEBUG_DEFAULT = os.getenv("VOCALIP_DEBUG", "0").lower() not in ("0", "", "false", "no")
 DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug")
 
-# ต่ำกว่านี้ถือว่าเดาคำไม่ได้ แล้วแอปจะขึ้นข้อความให้ลองใหม่แทนการโชว์คำมั่วๆ
-#
-# ตั้งผ่าน VOCALIP_MIN_CONFIDENCE ได้ เพราะค่าที่เหมาะต้องจูนจากของจริง และ
-# แก้ที่นี่แล้วรีสตาร์ท server พอ ไม่ต้อง build APK ใหม่ทุกครั้งที่อยากลองค่าใหม่
-#
-# วัดจริงกับ checkpoint ตัวปัจจุบัน: ปากจริงได้ราว 0.23-0.28 ส่วนภาพขยะ
-# (ดำ/ขาว/noise) ได้ 0.16-0.24 — สองช่วงนี้ทับกัน จึงไม่มีค่าไหนที่แยกได้สะอาด
-# ค่า 0.20 เลือกให้ผ่านการพูดจริงเกือบทั้งหมดและกันขยะบางส่วน ถ้าตั้งสูงกว่า
-# ~0.29 แอปจะขึ้นว่าอ่านไม่ได้ทุกครั้ง เพราะโมเดลตัวนี้ไม่เคยมั่นใจถึงขนาดนั้น
-MIN_WORD_CONFIDENCE = float(os.getenv("VOCALIP_MIN_CONFIDENCE", "0.20"))
+# เกณฑ์ปฏิเสธผลที่ไม่น่าเชื่อถือ ค่าตั้งต้นมากับ checkpoint (ดู meta['rejection'])
+# จึงไม่ต้องตั้งเองที่นี่ ตัวแปรสภาพแวดล้อมสองตัวนี้ไว้ทับค่านั้นเวลาอยากลองจูน
+# โดยไม่ต้องแก้ไฟล์โมเดล — ตั้งแล้วรีสตาร์ท server พอ ไม่ต้อง build APK ใหม่
+_env_conf = os.getenv("VOCALIP_MIN_CONFIDENCE")
+MIN_WORD_CONFIDENCE_ENV = float(_env_conf) if _env_conf else None
+
+# ปิด motion gate ได้เวลาต้องการดูว่าโมเดลตอบอะไรจริงๆ โดยไม่มีด่านมาขวาง
+MOTION_GATE_ENABLED = os.getenv("VOCALIP_MOTION_GATE", "1").lower() not in (
+    "0", "", "false", "no")
 
 # Global model storage
 models = {}
@@ -101,30 +100,46 @@ async def load_models():
 
     # VocaLip Thai: ทำนายเป็น "คำ" จาก 44 คำที่เทรนไว้ (คนละตระกูลกับสองตัวบน
     # ซึ่งเป็น CTC ระดับตัวอักษร) จึงแยก endpoint และแยก preprocessing กันคนละชุด
-    word_path = os.path.join(MODEL_DIR, "03_vocalip_44words_deployment.pt")
-    if os.path.exists(word_path):
+    #
+    # รองรับสอง checkpoint ที่ฟอร์แมตต่างกัน เรียงจากใหม่ไปเก่า ตัวแรกที่เจอชนะ
+    # รุ่น 05 บอกค่า deployment มาครบกว่ามาก (ลำดับช่องสี, เกณฑ์ปฏิเสธ,
+    # motion gate) จึงไม่ต้องเดาอะไรเองเหมือนตอนใช้รุ่น 03
+    word_candidates = [
+        ("05_44word_real_lipreading_deployment.pt", load_vocalip_real_model),
+        ("03_vocalip_44words_deployment.pt", load_vocalip_word_model),
+    ]
+    for filename, loader in word_candidates:
+        word_path = os.path.join(MODEL_DIR, filename)
+        if not os.path.exists(word_path):
+            continue
         try:
-            model, id_to_word, meta = load_vocalip_word_model(word_path)
+            model, id_to_word, meta = loader(word_path)
             models["vocalip_word"] = {
                 "model": model,
                 "id_to_word": id_to_word,
                 "meta": meta,
                 "type": "word_classifier",
             }
-            cfg = meta["config"]
-            acc = meta.get("test_metrics", {}).get("accuracy")
+            pre = meta.get("preprocessing", {})
+            metrics = meta.get("test_metrics", {})
             print(
-                f"✅ VocaLip word model loaded: {word_path} "
-                f"({meta['num_classes']} words, {cfg.get('frames')} frames, "
-                f"roi={cfg.get('roi')}, test acc={acc:.2%})"
-                if acc is not None else
-                f"✅ VocaLip word model loaded: {word_path}"
+                f"✅ VocaLip word model loaded: {filename} "
+                f"({meta['num_classes']} words, "
+                f"{_want_frames(meta)} frames, roi={_roi_size(meta)}, "
+                f"channels={pre.get('cache_channel_order', 'BGR')})"
             )
+            if metrics:
+                print(
+                    f"   test acc={metrics.get('accuracy', 0):.2%} "
+                    f"macro-F1={metrics.get('macro_f1', 0):.4f} "
+                    f"top3={metrics.get('top3', 0):.2%}"
+                )
             print(f"   ⚠️ scope: {meta.get('scope')}")
+            break
         except Exception as e:
-            print(f"❌ Failed to load VocaLip word model: {e}")
+            print(f"❌ Failed to load {filename}: {e}")
     else:
-        print(f"⚠️ VocaLip word model not found: {word_path}")
+        print("⚠️ ไม่พบ checkpoint โมเดลทำนายคำใน server/models/")
 
     if not models:
         print("⚠️ No models loaded! Place .pt files in server/models/")
@@ -179,6 +194,15 @@ class WordPredictResponse(BaseModel):
     # เกณฑ์ที่ใช้ตัดสิน low_confidence ส่งมาด้วยเพื่อให้ตรวจสอบได้ว่า server
     # ตั้งไว้เท่าไร โดยไม่ต้องเดาจากฝั่ง client
     min_confidence: float
+    # ระยะห่างระหว่างอันดับ 1 กับอันดับ 2 — ใกล้กันมากแปลว่าโมเดลลังเล
+    # แม้ความมั่นใจอันดับ 1 จะดูสูงก็ตาม checkpoint กำหนดเกณฑ์นี้มาด้วย
+    min_margin: float
+    margin: float
+    # ปริมาณการขยับปากที่วัดได้ และเกณฑ์ที่ checkpoint กำหนด (null = ไม่ได้ใช้)
+    mouth_motion: float
+    motion_threshold: Optional[float] = None
+    # ข้อที่ไม่ผ่าน: "confidence" / "margin" / "motion" — ว่างแปลว่าผ่านหมด
+    reject_reasons: List[str] = []
     # มีค่าเฉพาะตอนเปิด debug — รูปร่าง/ช่วงค่าของ tensor ในแต่ละขั้น
     debug: Optional[dict] = None
 
@@ -232,7 +256,10 @@ def _model_summary(info: dict) -> dict:
     meta = info.get("meta", {})
     return {
         "type": info["type"],
+        "format": meta.get("format"),
         "config": meta.get("config", {}),
+        "frames": _want_frames(meta),
+        "roi": _roi_size(meta),
         "vocab_size": meta.get("num_classes"),
         "test_metrics": meta.get("test_metrics", {}),
         "scope": meta.get("scope"),
@@ -375,6 +402,36 @@ def _decode_color_frame(b64_string: str, roi: int) -> np.ndarray:
     return np.ascontiguousarray(img)
 
 
+def _want_frames(meta: dict) -> int:
+    """จำนวนเฟรมที่โมเดลรับ — คีย์คนละชื่อกันระหว่าง checkpoint สองรุ่น"""
+    pre = meta.get("preprocessing", {})
+    cfg = meta.get("config", {})
+    return int(pre.get("target_frames") or cfg.get("frames") or 16)
+
+
+def _roi_size(meta: dict) -> int:
+    """ขนาดด้านของภาพปากที่โมเดลรับ (จัตุรัส)"""
+    pre = meta.get("preprocessing", {})
+    cfg = meta.get("config", {})
+    return int(pre.get("roi_size") or cfg.get("roi") or 112)
+
+
+def _mouth_motion(frames: np.ndarray) -> float:
+    """ปริมาณการขยับปากตลอดคลิป
+
+    นิยาม: ค่าเฉลี่ยของ |เฟรม(t) - เฟรม(t-1)| ทุกพิกเซลทุกช่องสี บนสเกล 0-1
+    (คือหาร 255 แล้ว แต่ยังไม่ normalize ด้วย mean/std)
+
+    ⚠️ checkpoint บอกแค่ตัวเลข threshold มา ไม่ได้บอกว่าวัดด้วยสูตรไหน
+    นิยามข้างบนเป็นสิ่งที่ฝั่ง deployment เลือกใช้ และรายงานค่าที่วัดได้กลับไป
+    ใน response ทุกครั้ง เพื่อให้เทียบกับฝั่งเทรนได้ว่าตรงกันหรือไม่
+    """
+    if len(frames) < 2:
+        return 0.0
+    x = frames.astype(np.float32) / 255.0
+    return float(np.abs(np.diff(x, axis=0)).mean())
+
+
 def _save_debug_frames(frames: np.ndarray) -> dict:
     """เซฟภาพ mouth ROI ที่ server ได้รับจริงลง server/debug/ ไว้เปิดดูด้วยตา
 
@@ -431,13 +488,23 @@ async def predict_word(request: WordPredictRequest):
     model = entry["model"]
     id_to_word = entry["id_to_word"]
     meta = entry["meta"]
-    cfg = meta["config"]
     pre = meta["preprocessing"]
 
-    want_frames = int(cfg.get("frames", 16))
-    roi = int(cfg.get("roi", 112))
+    want_frames = _want_frames(meta)
+    roi = _roi_size(meta)
     mean = np.array(pre.get("mean", [0.485, 0.456, 0.406]), dtype=np.float32)
     std = np.array(pre.get("std", [0.229, 0.224, 0.225]), dtype=np.float32)
+
+    # เกณฑ์ปฏิเสธมากับ checkpoint ให้ใช้ค่านั้นเป็นหลัก ยกเว้นตั้ง env มาทับ
+    rej = meta.get("rejection", {})
+    min_conf = (MIN_WORD_CONFIDENCE_ENV
+                if MIN_WORD_CONFIDENCE_ENV is not None
+                else float(rej.get("confidence_threshold_start", 0.35)))
+    min_margin = float(rej.get("top1_top2_margin_start", 0.0))
+
+    gate = meta.get("motion_gate", {})
+    gate_on = bool(gate.get("enabled")) and MOTION_GATE_ENABLED
+    gate_threshold = float(gate.get("starting_threshold", 0.0))
 
     debug = DEBUG_DEFAULT if request.debug is None else bool(request.debug)
     dbg: dict = {}
@@ -446,7 +513,9 @@ async def predict_word(request: WordPredictRequest):
         selected = _pick_evenly(list(request.frames), want_frames)
         frames = np.stack([_decode_color_frame(b, roi) for b in selected])
 
-        # ลำดับขั้นตรงตาม Notebook 03 CELL 2: /255 -> (x-mean)/std -> THWC->TCHW
+        # ลำดับขั้นตรงตาม preprocessing ที่ checkpoint ระบุ:
+        # /255 -> (x-mean)/std -> THWC->TCHW -> เพิ่มมิติ batch
+        # ไม่มีการสลับ BGR->RGB เพราะ checkpoint ระบุ convert_bgr_to_rgb=False
         x = frames.astype(np.float32) / 255.0
         x = (x - mean[None, None, None, :]) / std[None, None, None, :]
         x = np.ascontiguousarray(np.transpose(x, (0, 3, 1, 2)), dtype=np.float32)
@@ -468,12 +537,16 @@ async def predict_word(request: WordPredictRequest):
             for p, i in zip(top_p, top_i)
         ]
 
+        motion = _mouth_motion(frames)
+
         if debug:
             dbg = {
                 "buffer": f"{len(request.frames)} received -> {want_frames} used",
                 "roi_shape": list(frames.shape[1:]),
                 "roi_uint8_range": [int(frames.min()), int(frames.max())],
-                "channel_order": "BGR",
+                "channel_order": pre.get("cache_channel_order", "BGR"),
+                "mouth_motion": round(motion, 6),
+                "motion_threshold": round(gate_threshold, 6),
                 "input_tensor_shape": list(tensor.shape),
                 "input_tensor_dtype": str(tensor.dtype),
                 "input_tensor_min": round(float(tensor.min()), 4),
@@ -493,6 +566,19 @@ async def predict_word(request: WordPredictRequest):
 
     elapsed = (time.time() - start_time) * 1000
 
+    # เหตุผลที่ปฏิเสธ แยกกันคนละข้อ เพื่อให้ไล่ได้ว่าติดด่านไหน
+    # ทั้งสามข้อมาจาก checkpoint ไม่ใช่เกณฑ์ที่ฝั่ง deployment คิดขึ้นเอง
+    margin = (candidates[0].confidence - candidates[1].confidence
+              if len(candidates) > 1 else candidates[0].confidence)
+
+    reasons = []
+    if candidates[0].confidence < min_conf:
+        reasons.append("confidence")
+    if margin < min_margin:
+        reasons.append("margin")
+    if gate_on and motion < gate_threshold:
+        reasons.append("motion")
+
     return WordPredictResponse(
         word=candidates[0].word,
         confidence=candidates[0].confidence,
@@ -500,8 +586,13 @@ async def predict_word(request: WordPredictRequest):
         processing_time_ms=round(elapsed, 2),
         num_frames_received=len(request.frames),
         num_frames_used=want_frames,
-        low_confidence=candidates[0].confidence < MIN_WORD_CONFIDENCE,
-        min_confidence=MIN_WORD_CONFIDENCE,
+        low_confidence=bool(reasons),
+        min_confidence=min_conf,
+        min_margin=min_margin,
+        margin=round(margin, 4),
+        mouth_motion=round(motion, 6),
+        motion_threshold=round(gate_threshold, 6) if gate_on else None,
+        reject_reasons=reasons,
         debug=dbg or None,
     )
 
@@ -518,6 +609,8 @@ def _print_word_debug(dbg: dict, candidates: List[WordCandidate]) -> None:
           flush=True)
     print(f"Logits: {tuple(dbg['logits_shape'])} "
           f"min={dbg['logits_min']} max={dbg['logits_max']}", flush=True)
+    print(f"Mouth motion: {dbg['mouth_motion']} "
+          f"(threshold {dbg['motion_threshold']})", flush=True)
     print(f"\nTOP-{len(candidates)}", flush=True)
     for rank, c in enumerate(candidates, 1):
         print(f"{rank}. {c.word}\t{c.confidence:.4f}", flush=True)
@@ -533,15 +626,22 @@ async def word_model_info():
         raise HTTPException(status_code=503, detail="โมเดลทำนายคำยังไม่ถูกโหลด")
 
     meta = entry["meta"]
+    pre = meta.get("preprocessing", {})
     return {
         "format": meta["format"],
-        "config": meta["config"],
-        "preprocessing": meta["preprocessing"],
-        # checkpoint เขียน channel_order ไว้กำกวมว่า "cached order; no channel
-        # swap" จึงระบุค่าที่ยืนยันกับผู้เทรนแล้วไว้ตรงนี้ให้ client อ่านได้ชัด
-        "channel_order_resolved": "BGR",
-        "test_metrics": meta["test_metrics"],
-        "scope": meta["scope"],
+        "config": meta.get("config", {}),
+        "preprocessing": pre,
+        "frames": _want_frames(meta),
+        "roi": _roi_size(meta),
+        # รุ่น 05 ระบุ cache_channel_order มาตรงๆ ส่วนรุ่น 03 เขียนไว้กำกวมว่า
+        # "cached order; no channel swap" จึงเติมค่าที่ยืนยันกับผู้เทรนแล้วให้
+        "channel_order_resolved": pre.get("cache_channel_order", "BGR"),
+        "rejection": meta.get("rejection", {}),
+        "motion_gate": meta.get("motion_gate", {}),
+        # นิยามที่ฝั่ง deployment ใช้วัด motion — checkpoint บอกแค่ตัวเลขเกณฑ์
+        "motion_metric": "mean |frame(t) - frame(t-1)| over all pixels, 0-1 scale",
+        "test_metrics": meta.get("test_metrics", {}),
+        "scope": meta.get("scope"),
         "words": [entry["id_to_word"][i] for i in sorted(entry["id_to_word"])],
     }
 

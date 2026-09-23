@@ -120,9 +120,21 @@ class WordPrediction {
   /// ฝั่งแอปเป็นคนตัดสินใจเองว่าจะแสดงผลนั้นหรือไม่
   final bool lowConfidence;
 
-  /// เกณฑ์ที่ server ใช้ตัดสิน [lowConfidence] ปรับได้ที่ server ด้วย
-  /// ตัวแปรสภาพแวดล้อม VOCALIP_MIN_CONFIDENCE
+  /// เกณฑ์ที่ server ใช้ตัดสิน [lowConfidence] ค่าตั้งต้นมากับไฟล์โมเดล
+  /// ทับได้ที่ server ด้วยตัวแปรสภาพแวดล้อม VOCALIP_MIN_CONFIDENCE
   final double minConfidence;
+
+  /// ระยะห่างระหว่างคำอันดับ 1 กับอันดับ 2 ใกล้กันมากแปลว่าโมเดลลังเล
+  /// แม้ความมั่นใจอันดับ 1 จะดูสูงก็ตาม
+  final double margin;
+  final double minMargin;
+
+  /// ปริมาณการขยับปากที่ server วัดได้จากเฟรมที่ส่งไป ปากนิ่งจะได้ 0
+  final double mouthMotion;
+
+  /// ข้อที่ไม่ผ่าน: confidence / margin / motion — ว่างแปลว่าผ่านหมด
+  /// มีไว้ให้ไล่ได้ว่าถูกปฏิเสธเพราะอะไร ไม่ใช่แค่รู้ว่าถูกปฏิเสธ
+  final List<String> rejectReasons;
 
   const WordPrediction({
     required this.word,
@@ -132,6 +144,10 @@ class WordPrediction {
     required this.framesUsed,
     required this.lowConfidence,
     required this.minConfidence,
+    required this.margin,
+    required this.minMargin,
+    required this.mouthMotion,
+    required this.rejectReasons,
   });
 
   factory WordPrediction.fromJson(Map<String, dynamic> json) => WordPrediction(
@@ -146,10 +162,23 @@ class WordPrediction {
         framesUsed: (json['num_frames_used'] as num?)?.toInt() ?? 0,
         lowConfidence: json['low_confidence'] as bool? ?? false,
         minConfidence: (json['min_confidence'] as num?)?.toDouble() ?? 0.0,
+        margin: (json['margin'] as num?)?.toDouble() ?? 0.0,
+        minMargin: (json['min_margin'] as num?)?.toDouble() ?? 0.0,
+        mouthMotion: (json['mouth_motion'] as num?)?.toDouble() ?? 0.0,
+        rejectReasons: (json['reject_reasons'] as List?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            const [],
       );
 
   @override
-  String toString() =>
-      '${topK.join(' / ')} (${processingTimeMs.toStringAsFixed(0)}ms, '
-      '$framesUsed frames, threshold ${minConfidence.toStringAsFixed(2)})';
+  String toString() {
+    final verdict =
+        rejectReasons.isEmpty ? 'accepted' : 'rejected: ${rejectReasons.join(",")}';
+    return '${topK.join(' / ')} '
+        '[margin ${margin.toStringAsFixed(3)}/${minMargin.toStringAsFixed(2)}, '
+        'conf min ${minConfidence.toStringAsFixed(2)}, '
+        'motion ${mouthMotion.toStringAsFixed(5)}] '
+        '${processingTimeMs.toStringAsFixed(0)}ms $framesUsed frames — $verdict';
+  }
 }
