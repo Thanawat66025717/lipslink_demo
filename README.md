@@ -1,16 +1,306 @@
-# lipslink
+# LipsLink (VocaLip Thai)
 
-A new Flutter project.
+แอป Android อ่านปากภาษาไทยด้วย AI สำหรับผู้ที่มีปัญหาด้านการพูด — ผู้ใช้พูดใส่กล้องหน้า
+แอปจับภาพปาก ส่งให้โมเดลทำนายว่าเป็นคำใด แล้วอ่านออกเสียงแทน พร้อมบันทึกวลีที่ใช้บ่อย
 
-## Getting Started
+โปรเจกต์นี้เป็นงานของนักศึกษา โมเดลเทรนโดยเพื่อนร่วมทีมคนละคนกับผู้พัฒนาแอป
+เอกสารนี้เขียนให้คนที่เปิดโปรเจกต์ครั้งแรกอ่านแล้วทำงานต่อได้ทันที
 
-This project is a starting point for a Flutter application.
+---
 
-A few resources to get you started if this is your first Flutter project:
+## สถาปัตยกรรม
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+```
+กล้องหน้า (Flutter)
+  └─ ML Kit Face Detection  ตรวจใบหน้า + เส้น contour ริมฝีปาก
+       └─ ตรวจว่าปากอ้า/หุบ  → ตัดสินว่าเริ่ม/จบการพูด
+            └─ ครอปปากเป็นภาพสี 112x112  เก็บไว้สูงสุด 40 เฟรม
+                 └─ เลือก 16 เฟรม → POST /predict_word (HTTP, JSON, base64 PNG)
+                      └─ FastAPI + PyTorch  ทำนาย 1 ใน 44 คำ
+                           └─ คืน top-3 + เกณฑ์ปฏิเสธ → แสดงผล + TTS อ่านออกเสียง
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+ฝั่งแอปกับฝั่งโมเดลแยกกันคนละเครื่อง คุยกันผ่าน HTTP เท่านั้น
+**ตอนนี้ server รันบนคอมของผู้พัฒนา ยังไม่ได้ deploy ขึ้นคลาวด์**
+
+### เทคโนโลยี
+
+| ฝั่ง | ใช้อะไร |
+|---|---|
+| แอป | Flutter, GoRouter, Riverpod, `camera`, `google_mlkit_face_detection`, `flutter_tts`, Hive |
+| บัญชี/ข้อมูล | Firebase Auth + Cloud Firestore (ประวัติวลีเก็บที่ `users/{uid}/history`) |
+| server | FastAPI, uvicorn, PyTorch (CPU), OpenCV, Pillow |
+
+---
+
+## โครงสร้างไฟล์ที่ควรรู้
+
+```
+lib/
+  app/app.dart                             นิยาม route ทั้งหมด (GoRouter)
+  features/
+    auth/screens/splash_screen.dart        ตัดสินใจว่าจะไป onboarding / login / scanner
+    onboarding/screens/                    หน้าแนะนำ 3 หน้า (วาดด้วย CustomPainter)
+    scanner/screens/scanner_screen.dart    ★ หัวใจของแอป ทุกอย่างเรื่องกล้อง/ครอป/ส่ง API
+    history/, profile/
+  shared/services/
+    lip_reading_api_service.dart           HTTP client คุยกับ server
+    tts_service.dart
+
+server/
+  app.py                                   FastAPI endpoints + preprocessing
+  lip_model.py                             นิยามสถาปัตยกรรมโมเดลทุกตัว + ตัวโหลด
+  models/                                  ไฟล์ .pt (ไม่อยู่ใน git — ขอจากทีม)
+  debug/                                   ภาพ mouth ROI ที่ server เซฟไว้ (gitignored)
+```
+
+---
+
+## โมเดล
+
+ไฟล์ปัจจุบัน: `server/models/05_44word_real_lipreading_deployment.pt` (8.8 MB, 2,187,405 พารามิเตอร์)
+เทรนด้วย Notebook `05_44word_real_lipreading` โดยเพื่อนร่วมทีม
+
+```
+CNN ต่อเฟรม (3→32→64→96→128) + AdaptiveAvgPool → Linear(128) + ReLU + Dropout
+  → BiGRU 2 ชั้น hidden 256
+    → Temporal Attention (512→128→1)
+      → LayerNorm → Linear(512→256) → ReLU → Linear(256→44)
+```
+
+### ข้อกำหนด input ที่ห้ามพลาด
+
+ค่าทั้งหมดนี้อ่านมาจากไฟล์ checkpoint เอง (คีย์ `preprocessing`) **ห้าม hardcode ที่อื่น**
+
+| อะไร | ค่า |
+|---|---|
+| จำนวนเฟรม | 16 |
+| ขนาดภาพ | 112 x 112 |
+| **ลำดับช่องสี** | **BGR — ห้ามแปลงเป็น RGB** |
+| normalize | `/255` แล้ว `(x-mean)/std` ด้วย ImageNet mean/std |
+| รูปร่าง tensor | `(1, 16, 3, 112, 112)` = B,T,C,H,W |
+
+> ⚠️ **BGR คือกับดักที่เคยทำให้ทำนายมั่วมาแล้ว** training cache สร้างด้วย OpenCV
+> ซึ่งให้ BGR และตอนเทรนไม่มีการแปลงเป็น RGB โมเดลจึงเรียนรู้บน BGR
+> `cv2.imdecode` คืน BGR อยู่แล้วจึงใช้ตรงๆ ส่วน PIL คืน RGB ต้องกลับช่องเอง
+> **สลับผิดแล้วไม่มี error ฟ้อง แค่ทำนายผิดเงียบๆ**
+
+### เกณฑ์ปฏิเสธผล (มากับ checkpoint)
+
+โมเดลถูกบังคับให้เลือก 1 ใน 44 คำเสมอ แม้ผู้ใช้จะพูดคำนอกชุดหรือไม่ได้พูดเลย
+จึงต้องมีด่านกรอง 3 ข้อ ผลจะแสดงก็ต่อเมื่อผ่านครบทั้งสาม
+
+| ด่าน | เกณฑ์ | ความหมาย |
+|---|---|---|
+| confidence | ≥ 0.35 | ความมั่นใจของคำอันดับ 1 |
+| margin | อันดับ1 − อันดับ2 ≥ 0.08 | กันกรณีโมเดลลังเลระหว่างสองคำ |
+| motion gate | ≥ 0.008581 | ปากต้องขยับจริง ไม่ใช่ภาพนิ่ง |
+
+สูตรวัด motion (ต้องตรงกับ `motion_score()` ใน Notebook 05 CELL 16 เป๊ะ):
+
+```python
+gray = frames.mean(-1)                        # เฉลี่ย 3 ช่องสีก่อน
+diff = abs(gray[1:] - gray[:-1])              # แล้วค่อยหาผลต่างระหว่างเฟรม
+diff = diff[:, .25h:.80h, .12w:.88w]          # ตัดเอาเฉพาะกลางภาพ
+motion = diff.mean()
+```
+ลำดับสำคัญ — ถ้าหาผลต่างทีละช่องสีแล้วค่อยเฉลี่ย จะได้ค่าสูงเกินจริงเสมอ
+
+### ผลวัดของโมเดล
+
+```
+accuracy 29.34%   macro-F1 0.2806   top-3 55.60%
+scope: 44-word closed-vocabulary; in-domain, NOT speaker-disjoint
+```
+
+**`NOT speaker-disjoint` แปลว่าชุดทดสอบมีคนพูดคนเดียวกับชุดเทรน**
+ความแม่นกับผู้ใช้หน้าใหม่จะต่ำกว่า 29% นี้อีก
+
+---
+
+## รันยังไง
+
+### 1. server (เปิดหน้าต่างค้างไว้)
+
+```powershell
+cd server
+pip install -r requirements.txt     # ครั้งแรกครั้งเดียว
+$env:VOCALIP_DEBUG = "1"            # เปิด log + เซฟภาพ debug
+python app.py                       # ฟังที่ 0.0.0.0:8000
+```
+
+ปิดด้วย Ctrl+C · เช็กว่าเปิดอยู่มั้ยด้วย `curl http://localhost:8000/health`
+
+ตัวแปรสภาพแวดล้อม (ไม่ใส่ก็ได้ ใช้ค่าจาก checkpoint):
+
+| ตัวแปร | ทำอะไร |
+|---|---|
+| `VOCALIP_DEBUG=1` | print ทุกขั้นของ pipeline + เซฟภาพลง `server/debug/` |
+| `VOCALIP_MIN_CONFIDENCE` | ทับเกณฑ์ confidence จาก checkpoint |
+| `VOCALIP_MOTION_GATE=0` | ปิด motion gate เวลาอยากดูว่าโมเดลตอบอะไรจริงๆ |
+
+### 2. แอป
+
+URL ของ server ฝังตอน build ผ่าน `--dart-define` **ถ้า IP เปลี่ยนต้อง build ใหม่**
+
+```powershell
+# อีมูเลเตอร์ (10.0.2.2 คือเครื่อง host เมื่อมองจากอีมูเลเตอร์)
+flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8000
+
+# มือถือจริง ใช้ IP ของคอมในวง LAN (หาด้วย ipconfig)
+flutter run --dart-define=API_BASE_URL=http://192.168.1.100:8000
+```
+
+ไม่ใส่ `--dart-define` จะใช้ค่าเริ่มต้น `http://10.0.2.2:8000`
+`.vscode/launch.json` มี config พร้อมใช้ กด F5 เลือกได้เลย
+
+---
+
+## API
+
+| endpoint | ทำอะไร |
+|---|---|
+| `GET /health` | สถานะ + โมเดลที่โหลดอยู่ (แอปเรียกทุก 20 วินาที) |
+| `POST /predict_word` | ★ ที่แอปใช้จริง — ส่งภาพปาก คืน 1 ใน 44 คำ |
+| `GET /word_model_info` | รายละเอียดโมเดล + คำทั้ง 44 + เกณฑ์ + สูตร motion |
+| `POST /predict` | โมเดล CTC ตัวเก่า (ระดับตัวอักษร) — **แอปไม่ได้ใช้แล้ว** |
+
+`POST /predict_word` ส่งกี่เฟรมก็ได้ server จะเลือก/เติมให้เหลือ 16 เอง
+
+```jsonc
+// request
+{ "frames": ["<base64 PNG>", ...], "top_k": 3, "debug": true }
+
+// response
+{
+  "word": "จะ", "confidence": 0.3725,
+  "top_k": [{"word":"จะ","confidence":0.3725}, ...],
+  "low_confidence": false,          // true = ไม่ควรแสดงผลนี้
+  "reject_reasons": [],             // "confidence" | "margin" | "motion"
+  "min_confidence": 0.35, "margin": 0.29,
+  "mouth_motion": 0.0497, "motion_threshold": 0.008581,
+  "processing_time_ms": 68.2, "num_frames_used": 16
+}
+```
+
+> ⚠️ FastAPI ไม่ส่ง `charset` มาใน Content-Type ฝั่ง Dart ต้อง
+> `utf8.decode(response.bodyBytes)` เอง ไม่งั้น `package:http` จะ fallback
+> เป็น latin1 แล้วคำไทยกลายเป็นตัวขยะโดยไม่มี error
+
+---
+
+## กับดักที่เคยเสียเวลาไปแล้ว (อ่านก่อนแก้ `scanner_screen.dart`)
+
+ทุกข้อในนี้**พังแบบเงียบๆ** ไม่มี exception ไม่มี log ฟ้อง มีแค่ผลทำนายที่มั่ว
+
+1. **ต้อง encode เป็นไฟล์ PNG จริง** — server ถอดด้วย `cv2.imdecode`/PIL
+   ส่ง raw pixel bytes ไปตรงๆ จะถอดไม่ออกและ prediction ล้มเหลวทุกครั้ง
+
+2. **พิกัดจาก ML Kit อยู่ในภาพที่หมุนตั้งแล้ว** แต่บัฟเฟอร์กล้องยังไม่หมุน
+   กล้องหน้ามือถือรายงาน 90/270 องศาเสมอ ถ้าเอาพิกัดไปอ่านพิกเซลตรงๆ
+   จะครอปไปคนละที่กับปาก — ต้องแปลงพิกัดย้อนกลับทุกจุดก่อนอ่าน
+
+3. **ต้องอ่าน U/V ด้วย ไม่ใช่แค่ Y** — `image.planes[0]` คือ luma = ภาพขาวดำ
+   โมเดลรับ 3 ช่องสี ส่งขาวดำไป server รันผ่านไม่ error แต่ทำนายมั่ว
+
+4. **ขนาดกรอบครอปต้องนิ่งตลอดหนึ่งประโยค** — กรอบดิบจาก contour โตตามตอนอ้าปาก
+   และกระโดดเป็นเท่าตัวเวลา ML Kit อ่านพลาด ทำให้โมเดลเห็นภาพซูมเข้าออกในคลิปเดียว
+   ตอนนี้ใช้ค่าเฉลี่ยถ่วงน้ำหนักที่รีเซ็ตทุกประโยค ส่วนจุดกึ่งกลางยังตามปากทุกเฟรม
+
+5. **`enableContours: true` ห้ามปิด** — แม้จะกินเวลาราวครึ่งหนึ่งของงานต่อเฟรม
+   เพราะทั้งการตรวจปากอ้าและการครอป ROI ใช้จุด contour ริมฝีปาก
+
+6. **อย่าใช้ `setState` ต่อเฟรมกล้อง** — ใช้ `ValueNotifier` + `RepaintBoundary`
+   ให้วาดใหม่เฉพาะ overlay ไม่งั้นทั้งหน้าจอ rebuild 30 ครั้งต่อวินาที
+
+---
+
+## วิธี debug เมื่อผลทำนายดูผิด
+
+เปิด `VOCALIP_DEBUG=1` แล้วดู 2 อย่างนี้ ตอบได้เกือบทุกปัญหา
+
+**1. `server/debug/frames_strip.png`** — ภาพปากจริง 16 เฟรมเรียงต่อกัน
+ใช้ตาดูอย่างเดียวก็บอกได้ว่าผิดตรงไหน
+
+| เห็นอะไร | แปลว่า |
+|---|---|
+| ปากอยู่กลางภาพ ขยับตลอด สีผิวปกติ | ถูกต้อง ปัญหาอยู่ที่ตัวโมเดล |
+| เห็นจมูก/คาง/หู ไม่ใช่ปาก | ครอปผิดตำแหน่ง — ดูเรื่องการแปลงพิกัด |
+| **ผิวหน้าเป็นสีฟ้า** | **ช่องสีสลับ — มี BGR↔RGB ผิดที่ไหนสักแห่ง** |
+| ภาพขาวดำ | อ่านแต่ plane Y ไม่ได้อ่าน U/V |
+| ขนาดเดี๋ยวใหญ่เดี๋ยวเล็ก | กรอบครอปไม่นิ่ง |
+| ปากไม่ขยับเลยทั้ง 16 เฟรม | เก็บเฟรมผิดช่วง หรือผู้ใช้ไม่ได้พูดจริง |
+
+**2. console ของ server** — พิมพ์ทุกขั้นให้ไล่ทีละบรรทัด
+
+```
+Buffer: 16 received -> 16 used
+ROI: (112, 112, 3) BGR uint8 range [5, 240]
+Input tensor: (1, 16, 3, 112, 112) torch.float32 min=-2.03 max=2.31
+Logits: (1, 44) min=-18.41 max=0.22
+Mouth motion: 0.049687 (threshold 0.008581)
+
+TOP-3
+1. จะ    0.3725
+2. มัน   0.0821
+3. ใน    0.0762
+```
+
+`Input tensor` ที่ไม่ใช่ `(1,16,3,112,112)` หรือช่วงค่าหลุดจาก −2.1 ถึง 2.6
+แปลว่า preprocessing ผิด ไม่ต้องไปโทษโมเดล
+
+---
+
+## โหมดจำลอง (เมื่อต่อ server ไม่ได้)
+
+แอปเช็ก `/health` ทุก 20 วินาที ถ้าต่อไม่ได้จะขึ้นแถบสีส้มแล้วสลับไป
+**เล่นประโยคสำเร็จรูปที่สุ่มจากลิสต์ 15 ประโยคในโค้ด** ไม่ได้อ่านปากจริงเลย
+ไม่เก็บภาพปากด้วยซ้ำ — เปิด server กลับมาเมื่อไหร่แอปกลับมาเชื่อมเองใน 20 วินาที
+ไม่ต้องปิดเปิดแอป
+
+⚠️ **ระวังตอนพรีเซนต์** ถ้าลืมเปิด server แอปจะดูทำงานได้ดีมากทั้งที่แค่เล่นบทที่เขียนไว้
+ตัวสังเกต: โหมดจำลองให้**ประโยคยาวหลายคำ** ส่วนของจริงให้**คำเดียวเสมอ**
+
+---
+
+## ปัญหาที่ยังค้างอยู่
+
+### ระดับโมเดล (แก้ที่ฝั่งเทรนเท่านั้น)
+
+- **มั่นใจกับ noise มากกว่าคนพูดจริง** — ทดสอบแล้ว: สัญญาณรบกวนสุ่มล้วนได้
+  confidence 0.667 ผ่านทุกด่าน ขณะที่พูดจริงได้ 0.30–0.37 เป็นอาการ
+  out-of-distribution ของ softmax classifier จูน threshold แก้ไม่ได้
+- **accuracy 29% และไม่ speaker-disjoint** — กับผู้ใช้หน้าใหม่จะต่ำกว่านี้
+
+### ยังไม่ได้ยืนยันกับผู้เทรน
+
+- **โค้ดที่สร้าง `mouth_cache_v3`** — Notebook 05 โหลดภาพจาก cache ที่สร้างไว้ก่อนแล้ว
+  ไม่มีโค้ดครอปอยู่ในนั้น จึงยังไม่รู้ว่า MOUTH_SCALE 2.4 คูณกับ**ความกว้างปาก**
+  หรือกับ **bounding box ทั้งหมด** (ซึ่งสูงขึ้นเวลาอ้าปาก)
+  **นี่คือจุดเดียวที่เหลือซึ่งอาจไม่ตรงกับตอนเทรนโดยไม่มีอะไรฟ้อง**
+- **เกณฑ์ motion 0.008581** มาจาก percentile ที่ 10 ของคลิปใน dataset
+  Notebook เองเตือนว่าให้วัดใหม่จากกล้องจริงตอนนั่งเฉยๆ 20–30 วินาทีก่อนใช้จริง
+
+### ระดับแอป
+
+- **ผลระหว่างพูดแทบไม่ขึ้น** — ตอนส่งไม่ครบ 16 เฟรม server เติมเฟรมสุดท้ายซ้ำ
+  ทำให้ค่า motion ตกจาก 0.047 เหลือ 0.013 และ confidence ตกลงด้วย
+  ผู้ใช้จึงต้องรอจนพูดจบถึงเห็นผล ขัดกับเป้าหมาย real-time
+- `_mouthOpenThreshold = 0.15` ยังไม่เคยจูนกับผู้ใช้จริง ถ้าค่านี้ผิด
+  ระบบจะไม่เริ่มเก็บเฟรมเลยตั้งแต่ต้น
+- server รันบนคอมเครื่องเดียว — ยังไม่ได้ deploy และ URL ฝังตอน build
+
+---
+
+## หมายเหตุสำหรับ Claude / AI ที่อ่านไฟล์นี้
+
+- คอมเมนต์ในโค้ดเขียนเป็นภาษาไทย และอธิบาย**เหตุผล**ว่าทำไมถึงเขียนแบบนั้น
+  หลายจุดเป็นบทเรียนจากบั๊กจริง อย่าลบทิ้งเวลา refactor
+- **ห้ามเดาค่า preprocessing หรือสถาปัตยกรรมโมเดล** ให้เปิดไฟล์ `.pt` ดูจริง
+  (`torch.load` แล้ว print คีย์กับ shape) โหลดด้วย `strict=True` เสมอ
+  เพื่อให้พังทันทีถ้าไม่ตรง ดีกว่าโหลดผ่านแล้วน้ำหนักบางส่วนเป็นค่าสุ่ม
+- ชั้นที่ไม่มีพารามิเตอร์ (ReLU, Dropout, MaxPool) **`strict=True` จับไม่ได้**
+  แต่ ReLU มีผลกับ inference — ต้องเทียบกับโค้ดเทรนด้วยตา
+- ไฟล์ `.pt` ไม่อยู่ใน git ถ้าไม่มีให้ขอจากทีม
+- เช็กงานด้วยการ**วัดจริง** ไม่ใช่เดา — เช่น ยิง request เทียบผลระหว่าง
+  input สองแบบ หรือเปิดภาพ debug ดู บั๊กในโปรเจกต์นี้แทบทั้งหมดเป็นชนิดที่เงียบ
