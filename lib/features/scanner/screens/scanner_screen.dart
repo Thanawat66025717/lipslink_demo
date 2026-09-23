@@ -995,8 +995,22 @@ class _ScannerScreenState extends State<ScannerScreen>
     _overlayData.dispose();
     _pulseCtrl.dispose();
     _waveCtrl.dispose();
-    _cameraController?.stopImageStream();
-    _cameraController?.dispose();
+    // ปล่อยกล้องโดยรอให้หยุดสตรีมก่อนจริงๆ ของเดิมเรียก dispose() ทับทันทีทั้งที่
+    // stopImageStream() ยังไม่จบ เฟรมที่ค้างอยู่จึงถูกส่งมาหลัง engine ถอดตัวไป
+    // แล้ว ทำให้แอป crash ตอนปิด (FlutterJNI is not attached to native)
+    final camera = _cameraController;
+    _cameraController = null;
+    if (camera != null) {
+      Future(() async {
+        try {
+          // เช็กก่อนเรียก เพราะ stopImageStream() โยน exception ถ้าไม่ได้สตรีมอยู่
+          if (camera.value.isStreamingImages) await camera.stopImageStream();
+        } catch (_) {
+          // ปิดแอปอยู่แล้ว ไม่มีใครต้องรู้ ขอแค่ให้ไปถึง dispose() ให้ได้
+        }
+        await camera.dispose();
+      });
+    }
     _faceDetector.close();
     _tts.stop();
     super.dispose();
