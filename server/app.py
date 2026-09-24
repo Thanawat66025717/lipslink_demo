@@ -67,6 +67,13 @@ MIN_WORD_CONFIDENCE_ENV = float(_env_conf) if _env_conf else None
 MOTION_GATE_ENABLED = os.getenv("VOCALIP_MOTION_GATE", "1").lower() not in (
     "0", "", "false", "no")
 
+# อัตราขยายกรอบครอปปากที่จะบอกให้แอปใช้ — ยังไม่รู้ว่าตอนเทรนใช้เท่าไร
+# (checkpoint ไม่ได้บอกมา และยังไม่ได้โค้ดที่สร้าง cache จากผู้เทรน) ตั้งค่านี้
+# แล้วรีสตาร์ท server แอปจะรับไปใช้เองภายใน 20 วินาที ไม่ต้อง build APK ใหม่
+# จึงลองหลายค่าเทียบกันได้เร็ว
+_env_scale = os.getenv("VOCALIP_MOUTH_SCALE")
+MOUTH_SCALE_OVERRIDE = float(_env_scale) if _env_scale else None
+
 # Global model storage
 models = {}
 
@@ -751,7 +758,11 @@ async def word_model_info():
         raise HTTPException(status_code=503, detail="โมเดลทำนายคำยังไม่ถูกโหลด")
 
     meta = entry["meta"]
-    pre = meta.get("preprocessing", {})
+    pre = dict(meta.get("preprocessing", {}))
+    # ให้ค่าที่ตั้งผ่าน env ทับค่าใน checkpoint เพื่อให้ทดลองได้โดยไม่ต้องแก้ไฟล์
+    # โมเดล ถ้าวันหนึ่งผู้เทรนใส่ mouth_scale มาใน checkpoint ค่านั้นจะถูกใช้เอง
+    if MOUTH_SCALE_OVERRIDE is not None:
+        pre["mouth_scale"] = MOUTH_SCALE_OVERRIDE
     return {
         "format": meta["format"],
         "config": meta.get("config", {}),
