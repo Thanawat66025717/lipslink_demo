@@ -104,14 +104,23 @@ async def load_models():
     # รองรับสอง checkpoint ที่ฟอร์แมตต่างกัน เรียงจากใหม่ไปเก่า ตัวแรกที่เจอชนะ
     # รุ่น 05 บอกค่า deployment มาครบกว่ามาก (ลำดับช่องสี, เกณฑ์ปฏิเสธ,
     # motion gate) จึงไม่ต้องเดาอะไรเองเหมือนตอนใช้รุ่น 03
+    # หาไฟล์ *_deployment.pt ทุกตัวในโฟลเดอร์ แล้วเรียงจากใหม่ไปเก่าตามชื่อ
+    # (ผู้เทรนขึ้นต้นชื่อด้วยเลขโน้ตบุ๊ก 03_, 05_, ... ซึ่งเรียงตามรุ่นพอดี)
+    # ไม่ผูกกับชื่อไฟล์ตายตัว เพราะรุ่นหน้าจะชื่ออะไรก็ได้ ถ้าผูกไว้แล้วลืมแก้
+    # server จะเงียบๆ ไม่โหลดอะไรเลย หรือแย่กว่านั้นคือเสิร์ฟรุ่นเก่าต่อไป
+    deployment_files = sorted(
+        (f for f in os.listdir(MODEL_DIR) if f.endswith("_deployment.pt")),
+        reverse=True,
+    ) if os.path.isdir(MODEL_DIR) else []
+
+    # ลองตัวโหลดทั้งสองแบบกับทุกไฟล์ ตัวไหนอ่านฟอร์แมตได้ก็ใช้ตัวนั้น
     word_candidates = [
-        ("05_44word_real_lipreading_deployment.pt", load_vocalip_real_model),
-        ("03_vocalip_44words_deployment.pt", load_vocalip_word_model),
+        (f, loader)
+        for f in deployment_files
+        for loader in (load_vocalip_real_model, load_vocalip_word_model)
     ]
     for filename, loader in word_candidates:
         word_path = os.path.join(MODEL_DIR, filename)
-        if not os.path.exists(word_path):
-            continue
         try:
             model, id_to_word, meta = loader(word_path)
             models["vocalip_word"] = {
@@ -136,10 +145,14 @@ async def load_models():
                 )
             print(f"   ⚠️ scope: {meta.get('scope')}")
             break
+        except ValueError:
+            # ฟอร์แมตไม่ตรงกับตัวโหลดนี้ เป็นเรื่องปกติเพราะเราลองทุกคู่
+            # ไฟล์จริงที่พังจะโยน exception ชนิดอื่นแล้วรายงานข้างล่างแทน
+            continue
         except Exception as e:
             print(f"❌ Failed to load {filename}: {e}")
     else:
-        print("⚠️ ไม่พบ checkpoint โมเดลทำนายคำใน server/models/")
+        print("⚠️ ไม่พบ checkpoint โมเดลทำนายคำที่อ่านได้ใน server/models/")
 
     if not models:
         print("⚠️ No models loaded! Place .pt files in server/models/")
