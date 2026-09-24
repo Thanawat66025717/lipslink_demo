@@ -478,7 +478,20 @@ def _log_prediction(row: dict) -> None:
     """
     try:
         os.makedirs(DEBUG_DIR, exist_ok=True)
+
+        # ถ้าไฟล์เดิมมีหัวตารางคนละชุด (เพราะเพิ่มคอลัมน์ทีหลัง) ต้องขึ้นไฟล์ใหม่
+        # ไม่งั้นค่าจะเลื่อนช่องทั้งไฟล์แบบเงียบๆ อ่านแล้วได้ตัวเลขผิดโดยไม่รู้ตัว
         is_new = not os.path.exists(PREDICTION_LOG)
+        if not is_new:
+            with open(PREDICTION_LOG, "r", encoding="utf-8-sig") as f:
+                old_header = (f.readline().strip().split(",")
+                              if os.path.getsize(PREDICTION_LOG) else [])
+            if old_header != _PREDICTION_LOG_HEADER:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                os.replace(PREDICTION_LOG,
+                           PREDICTION_LOG.replace(".csv", f".{stamp}.csv"))
+                is_new = True
+
         with open(PREDICTION_LOG, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=_PREDICTION_LOG_HEADER)
             if is_new:
