@@ -9,7 +9,6 @@ import 'package:flutter_animate/flutter_animate.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:uuid/uuid.dart';
 import 'package:flutter/foundation.dart';
-import 'dart:ui' as ui;
 // 🟢 เพิ่ม Firebase 
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -89,8 +88,14 @@ class _ScannerScreenState extends State<ScannerScreen>
   DateTime? _lastMouthRoiAt;
   // เก่ากว่านี้ถือว่าเชื่อไม่ได้แล้ว เพราะหน้าอาจเลื่อนไปไกลจนครอปผิดที่
   static const Duration _mouthRoiMaxAge = Duration(milliseconds: 600);
-  // กันไม่ให้การเข้ารหัส PNG ซ้อนกัน และทำให้เฟรมเรียงตามเวลาเสมอ
+  // กันไม่ให้การครอปซ้อนกัน และทำให้เฟรมเรียงตามเวลาเสมอ
   bool _isCollecting = false;
+  DateTime? _lastCollectAt;
+  // เว้นจังหวะระหว่างเฟรมที่เก็บ ไม่งั้นพอครอปเสร็จก็ครอปต่อทันทีไม่มีหยุด
+  // กลายเป็น busy loop ที่กิน isolate จนหมด ML Kit คืนผลไม่ได้ และ UI ค้าง
+  // (เห็นใน log ว่า "Skipped 718 frames") 50 ms = 20 เฟรม/วินาที ซึ่งพอให้
+  // 16 เฟรมกินเวลาราว 0.8 วินาที ใกล้เคียงตอนเทรนอยู่แล้ว ไม่ต้องเร็วกว่านี้
+  static const Duration _minCollectInterval = Duration(milliseconds: 50);
 
   // ขนาดด้านของกรอบครอป เฉลี่ยแบบถ่วงน้ำหนักตลอดหนึ่งประโยค (null = เริ่มใหม่)
   //
@@ -379,31 +384,33 @@ class _ScannerScreenState extends State<ScannerScreen>
     if (!_isApiAvailable) return;
     if (_collectedLipFrames.length >= _maxCollectFrames) return;
 
+    final now = DateTime.now();
+    final last = _lastCollectAt;
+    if (last != null && now.difference(last) < _minCollectInterval) return;
+
     final roi = _lastMouthRoi;
     final detectedAt = _lastMouthRoiAt;
     if (roi == null || detectedAt == null) return;
     // กรอบเก่าเกินไปแปลว่าหน้าอาจเลื่อนไปแล้ว รอ ML Kit ตรวจใหม่ดีกว่าครอปมั่ว
-    if (DateTime.now().difference(detectedAt) > _mouthRoiMaxAge) return;
-
-    // ครอปแบบ synchronous ก่อน จะได้ไม่ถือ CameraImage ข้าม await
-    // แล้วค่อยเข้ารหัส PNG แบบ async ซึ่งเป็นส่วนที่ช้ากว่า
-    final rgba = _cropMouthToRgba(image, roi, rotationDegrees);
-    if (rgba == null) return;
+    if (now.difference(detectedAt) > _mouthRoiMaxAge) return;
 
     _isCollecting = true;
-    _encodeRgbaPng(rgba, _roiSize, _roiSize).then((png) {
-      _collectedLipFrames.add(png);
-    }).catchError((Object e) {
-      debugPrint('Lip frame encode error: $e');
-    }).whenComplete(() {
+    _lastCollectAt = now;
+    try {
+      final rgb = _cropMouthToRgb(image, roi, rotationDegrees);
+      if (rgb != null) _collectedLipFrames.add(rgb);
+    } catch (e) {
+      debugPrint('Lip frame collection error: $e');
+    } finally {
       _isCollecting = false;
-      if (!mounted || _state != _SpeakingState.speaking) return;
-      if (_shouldFinalizeCapture()) {
-        _finalizeUtterance();
-      } else {
-        _maybePredictPartial();
-      }
-    });
+    }
+
+    if (!mounted || _state != _SpeakingState.speaking) return;
+    if (_shouldFinalizeCapture()) {
+      _finalizeUtterance();
+    } else {
+      _maybePredictPartial();
+    }
   }
 
   /// เก็บครบสำหรับหนึ่งคำแล้วหรือยัง
@@ -490,7 +497,7 @@ class _ScannerScreenState extends State<ScannerScreen>
   ///
   /// สุ่มจุดแบบ nearest-neighbour ทีละพิกเซลปลายทาง จึงไม่ต้องสร้างภาพสีเต็ม
   /// เฟรมกลางทาง — เสียเวลาแค่ราว 12,500 พิกเซลต่อเฟรมแทนที่จะเป็นหลักแสน
-  Uint8List? _cropMouthToRgba(
+  Uint8List? _cropMouthToRgb(
       CameraImage image, Rect roi, int rotationDegrees) {
     final planes = image.planes;
     if (planes.isEmpty) return null;
@@ -522,7 +529,7 @@ class _ScannerScreenState extends State<ScannerScreen>
       uOffset = vOffset + 1;
     }
 
-    final out = Uint8List(_roiSize * _roiSize * 4);
+    final out = Uint8List(_roiSize * _roiSize * 3);
     int o = 0;
 
     for (int oy = 0; oy < _roiSize; oy++) {
@@ -567,32 +574,15 @@ class _ScannerScreenState extends State<ScannerScreen>
         out[o++] = (luma + 1.402 * v).round().clamp(0, 255);
         out[o++] = (luma - 0.344136 * u - 0.714136 * v).round().clamp(0, 255);
         out[o++] = (luma + 1.772 * u).round().clamp(0, 255);
-        out[o++] = 255;
       }
     }
 
     return out;
   }
 
-  /// แปลงพิกเซล RGBA เป็นไฟล์ PNG
-  ///
-  /// สีที่ออกมาต้องถูกต้องตามจริง (ปากแดงต้องออกมาแดง) เพราะฝั่ง server
-  /// ถอดด้วย cv2.imdecode ซึ่งคืนค่าเป็น BGR พอดีกับที่โมเดลถูกเทรนมา
-  Future<Uint8List> _encodeRgbaPng(
-      Uint8List rgba, int width, int height) async {
-    final completer = Completer<ui.Image>();
-    ui.decodeImageFromPixels(
-      rgba,
-      width,
-      height,
-      ui.PixelFormat.rgba8888,
-      completer.complete,
-    );
-    final image = await completer.future;
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-    image.dispose();
-    return byteData!.buffer.asUint8List();
-  }
+  // เดิมตรงนี้เข้ารหัสพิกเซลเป็นไฟล์ PNG ก่อนส่ง แล้ว server ก็ถอดกลับมาเป็น
+  // พิกเซลชุดเดิม เป็นงานหนักทั้งสองฝั่งที่ไม่ได้อะไรกลับมา — และหนักพอที่จะ
+  // ทำให้ UI thread ค้างจน ML Kit ตรวจหน้าไม่ได้ ตอนนี้ส่งพิกเซลดิบไปตรงๆ
 
   /// เลือกเฟรมให้เหลือ 16 เฟรมกระจายเท่าๆ กันก่อนส่ง
   ///
@@ -887,6 +877,7 @@ class _ScannerScreenState extends State<ScannerScreen>
     try {
       final result = await LipReadingApiService.predictWord(
         snapshot,
+        roiSize: _roiSize,
         captureMs: captureMs,
         collectedFrames: _collectedLipFrames.length,
         isFinal: false,
@@ -967,6 +958,7 @@ class _ScannerScreenState extends State<ScannerScreen>
     try {
       final result = await LipReadingApiService.predictWord(
         _framesForModel(_collectedLipFrames),
+        roiSize: _roiSize,
         captureMs: _captureMs,
         collectedFrames: _collectedLipFrames.length,
         isFinal: true,
@@ -1661,4 +1653,4 @@ class _FaceOverlayPainter extends CustomPainter {
   }
 }
 
-enum _SpeakingState { idle, speaking, paused, finalizing }
+enum _SpeakingState { idle, speaking, paused, finalizing }

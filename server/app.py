@@ -196,6 +196,12 @@ class WordPredictRequest(BaseModel):
     collected_frames: Optional[int] = None
     # False = ผลระหว่างพูด, True = ผลตอนพูดจบ ใช้แยกแถวใน log ตอนวัดความแม่น
     is_final: Optional[bool] = None
+    # "png" (ค่าเดิม) = ไฟล์ภาพ / "rgb" = พิกเซลดิบ RGB เรียงต่อกัน ไม่มีหัวไฟล์
+    # แบบ rgb เลี่ยงการเข้ารหัสแล้วถอดกลับเป็นพิกเซลชุดเดิม ซึ่งหนักทั้งสองฝั่ง
+    frame_format: Optional[str] = "png"
+    # ขนาดด้านของภาพดิบ จำเป็นเฉพาะ frame_format="rgb" เพราะพิกเซลดิบไม่มีหัว
+    # ไฟล์บอกขนาดมาด้วย ไม่ส่งมาจะใช้ค่าจาก checkpoint
+    roi: Optional[int] = None
 
 
 class WordCandidate(BaseModel):
@@ -425,6 +431,29 @@ def _decode_color_frame(b64_string: str, roi: int) -> np.ndarray:
     return np.ascontiguousarray(img)
 
 
+def _decode_raw_rgb_frame(b64_string: str, src_roi: int, roi: int) -> np.ndarray:
+    """พิกเซลดิบ RGB -> ภาพ BGR ขนาด roi x roi (uint8, HWC)
+
+    client ส่ง RGB มาเพราะเป็นลำดับที่มันคำนวณออกมาตรงๆ จาก YUV ส่วนโมเดล
+    ต้องการ BGR (เหมือนที่ cv2.imdecode คืนมาตอนใช้ PNG) จึงกลับช่องที่นี่
+    ให้ได้ผลเหมือนกันทุกประการกับทางเดิม
+    """
+    raw = base64.b64decode(b64_string)
+    expected = src_roi * src_roi * 3
+    if len(raw) != expected:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"ขนาดพิกเซลดิบไม่ตรง: ได้ {len(raw)} ไบต์ "
+                    f"แต่ {src_roi}x{src_roi}x3 ต้องเป็น {expected}"),
+        )
+
+    img = np.frombuffer(raw, dtype=np.uint8).reshape(src_roi, src_roi, 3)
+    img = img[:, :, ::-1]                       # RGB -> BGR
+    if src_roi != roi:
+        img = cv2.resize(img, (roi, roi))
+    return np.ascontiguousarray(img)
+
+
 def _want_frames(meta: dict) -> int:
     """จำนวนเฟรมที่โมเดลรับ — คีย์คนละชื่อกันระหว่าง checkpoint สองรุ่น"""
     pre = meta.get("preprocessing", {})
@@ -580,7 +609,12 @@ async def predict_word(request: WordPredictRequest):
 
     try:
         selected = _pick_evenly(list(request.frames), want_frames)
-        frames = np.stack([_decode_color_frame(b, roi) for b in selected])
+        if (request.frame_format or "png").lower() == "rgb":
+            src_roi = int(request.roi or roi)
+            frames = np.stack(
+                [_decode_raw_rgb_frame(b, src_roi, roi) for b in selected])
+        else:
+            frames = np.stack([_decode_color_frame(b, roi) for b in selected])
 
         # ลำดับขั้นตรงตาม preprocessing ที่ checkpoint ระบุ:
         # /255 -> (x-mean)/std -> THWC->TCHW -> เพิ่มมิติ batch

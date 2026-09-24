@@ -40,6 +40,7 @@ class LipReadingApiService {
   /// 44 คำเสมอแม้ผู้ใช้พูดคำนอกชุด จึงควรดู [WordPrediction.lowConfidence] ด้วย
   static Future<WordPrediction?> predictWord(
     List<Uint8List> frames, {
+    required int roiSize,
     int topK = 3,
     int? captureMs,
     int? collectedFrames,
@@ -55,6 +56,11 @@ class LipReadingApiService {
             body: jsonEncode({
               'frames': frames.map(base64Encode).toList(),
               'top_k': topK,
+              // พิกเซลดิบ RGB เรียงแถวละ roi*3 ไบต์ ไม่ใช่ไฟล์ภาพ — เลี่ยงการ
+              // เข้ารหัส PNG แล้วให้ server ถอดกลับเป็นพิกเซลชุดเดิม ซึ่งหนัก
+              // พอที่จะทำให้ UI thread ค้างจนตรวจใบหน้าไม่ทัน
+              'frame_format': 'rgb',
+              'roi': roiSize,
               if (captureMs != null) 'capture_ms': captureMs,
               // จำนวนเฟรมที่เก็บได้จริง ต่างจาก frames.length ที่ถูกลดเหลือ
               // เท่าที่โมเดลรับแล้ว — ต้องใช้ตัวนี้คำนวณอัตราเฟรมต่อวินาที
