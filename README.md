@@ -129,7 +129,14 @@ $env:VOCALIP_DEBUG = "1"            # เปิด log + เซฟภาพ debu
 python app.py                       # ฟังที่ 0.0.0.0:8000
 ```
 
-ปิดด้วย Ctrl+C · เช็กว่าเปิดอยู่มั้ยด้วย `curl http://localhost:8000/health`
+ปิดด้วย Ctrl+C · เช็กว่าเปิดอยู่มั้ยด้วย:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/health | ConvertTo-Json -Depth 5
+```
+
+> บน PowerShell คำว่า `curl` เป็นชื่อเล่นของ `Invoke-WebRequest` ซึ่งพยายามแกะ HTML
+> แล้วเด้งคำเตือนความปลอดภัยขึ้นมา ถ้าติดนิสัยพิมพ์ `curl` ให้ใช้ `curl.exe` แทน
 
 ตัวแปรสภาพแวดล้อม (ไม่ใส่ก็ได้ ใช้ค่าจาก checkpoint):
 
