@@ -42,6 +42,7 @@ class LipReadingApiService {
     List<Uint8List> frames, {
     int topK = 3,
     int? captureMs,
+    int? collectedFrames,
     bool? isFinal,
   }) async {
     if (frames.isEmpty) return null;
@@ -55,6 +56,9 @@ class LipReadingApiService {
               'frames': frames.map(base64Encode).toList(),
               'top_k': topK,
               if (captureMs != null) 'capture_ms': captureMs,
+              // จำนวนเฟรมที่เก็บได้จริง ต่างจาก frames.length ที่ถูกลดเหลือ
+              // เท่าที่โมเดลรับแล้ว — ต้องใช้ตัวนี้คำนวณอัตราเฟรมต่อวินาที
+              if (collectedFrames != null) 'collected_frames': collectedFrames,
               if (isFinal != null) 'is_final': isFinal,
             }),
           )

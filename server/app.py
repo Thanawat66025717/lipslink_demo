@@ -191,6 +191,9 @@ class WordPredictRequest(BaseModel):
     # เวลาที่ใช้เก็บเฟรมทั้งชุด (มิลลิวินาที) — บอกได้ว่ากล้องเก็บได้กี่เฟรม
     # ต่อวินาที ซึ่งต้องใกล้เคียงกับตอนเทรน ไม่งั้นโมเดลเห็นปากขยับคนละความเร็ว
     capture_ms: Optional[int] = None
+    # จำนวนเฟรมที่ client เก็บได้จริง ต่างจาก len(frames) ที่ถูกลดเหลือเท่าที่
+    # โมเดลรับแล้ว — ต้องใช้ตัวนี้หารเวลา ไม่งั้นได้อัตราเฟรมที่ต่ำกว่าความจริง
+    collected_frames: Optional[int] = None
     # False = ผลระหว่างพูด, True = ผลตอนพูดจบ ใช้แยกแถวใน log ตอนวัดความแม่น
     is_final: Optional[bool] = None
 
@@ -463,7 +466,7 @@ PREDICTION_LOG = os.path.join(DEBUG_DIR, "predictions.csv")
 _PREDICTION_LOG_HEADER = [
     "time", "is_final", "top1", "conf1", "top2", "conf2", "top3", "conf3",
     "margin", "motion", "accepted", "reject_reasons",
-    "frames_received", "capture_ms", "capture_fps",
+    "frames_received", "collected_frames", "capture_ms", "capture_fps",
 ]
 
 
@@ -635,7 +638,8 @@ async def predict_word(request: WordPredictRequest):
     def _cand(i: int, field: str):
         return getattr(candidates[i], field) if i < len(candidates) else ""
 
-    fps = (round(len(request.frames) / (request.capture_ms / 1000.0), 1)
+    collected = request.collected_frames or len(request.frames)
+    fps = (round(collected / (request.capture_ms / 1000.0), 1)
            if request.capture_ms else "")
     _log_prediction({
         "time": datetime.now().strftime("%H:%M:%S"),
@@ -648,6 +652,7 @@ async def predict_word(request: WordPredictRequest):
         "accepted": not reasons,
         "reject_reasons": "|".join(reasons),
         "frames_received": len(request.frames),
+        "collected_frames": collected,
         "capture_ms": request.capture_ms if request.capture_ms else "",
         "capture_fps": fps,
     })

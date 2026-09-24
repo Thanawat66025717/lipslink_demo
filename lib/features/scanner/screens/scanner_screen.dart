@@ -846,6 +846,7 @@ class _ScannerScreenState extends State<ScannerScreen>
       final result = await LipReadingApiService.predictWord(
         snapshot,
         captureMs: captureMs,
+        collectedFrames: _collectedLipFrames.length,
         isFinal: false,
       );
 
@@ -925,6 +926,7 @@ class _ScannerScreenState extends State<ScannerScreen>
       final result = await LipReadingApiService.predictWord(
         _framesForModel(_collectedLipFrames),
         captureMs: _captureMs,
+        collectedFrames: _collectedLipFrames.length,
         isFinal: true,
       );
 
