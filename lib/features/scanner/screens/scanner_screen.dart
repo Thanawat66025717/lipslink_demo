@@ -59,15 +59,25 @@ class _ScannerScreenState extends State<ScannerScreen>
   // เริ่มต้นที่ต้อง fine-tune ต่อจากค่าจริงที่ debugPrint ออกมา
   static const double _mouthOpenThreshold = 0.15;
 
-  // ─── Mouth ROI (ต้องตรงกับตอนเทรนโมเดล 44 คำ) ─────────────────────────────
-  // ครอปกว้างกว่ากรอบริมฝีปากจริง 2.4 เท่า ตามค่า MOUTH_SCALE ที่ใช้ตอนสร้าง
+  // ─── Mouth ROI (ต้องตรงกับตอนเทรนโมเดลเป๊ะ) ───────────────────────────────
+  //
+  // ค่าสามตัวนี้เป็นของโมเดล ไม่ใช่ของแอป เปลี่ยนได้ทุกครั้งที่เปลี่ยนไฟล์โมเดล
+  // จึงถามจาก server ตอนเริ่ม (ดู _syncModelConfig) แทนการฝังตายตัว — ไม่งั้น
+  // วันที่โมเดลรุ่นใหม่ใช้ค่าอื่น แอปจะส่งของผิดขนาดไปแล้วทำนายมั่วเงียบๆ
+  //
+  // ค่าที่ตั้งไว้ตรงนี้เป็นค่าสำรองของโมเดลปัจจุบัน ใช้ตอนที่ยังถาม server ไม่ได้
+
+  // ครอปกว้างกว่ากรอบริมฝีปากจริงเท่านี้เท่า ตามค่า MOUTH_SCALE ที่ใช้ตอนสร้าง
   // training cache ครอปแคบหรือกว้างกว่านี้ โมเดลจะเห็นบริบทไม่เท่าที่เคยเห็นมา
-  static const double _mouthScale = 2.4;
-  // ขนาดภาพที่โมเดลรับ (checkpoint ระบุ roi=112) ย่อตั้งแต่ฝั่งแอปเลย
-  // จะได้ไม่ต้องส่งภาพใหญ่เกินจำเป็นข้ามเน็ตไปให้ server ย่อทีหลัง
-  static const int _roiSize = 112;
-  // จำนวนเฟรมที่โมเดลรับต่อหนึ่งคลิป (checkpoint ระบุ frames=16)
-  static const int _modelFrameCount = 16;
+  //
+  // ⚠️ ค่านี้ยังไม่ได้ยืนยันกับผู้เทรน checkpoint ไม่ได้บอกมาด้วย จะอัปเดตเองได้
+  // ก็ต่อเมื่อผู้เทรนใส่ mouth_scale ลงใน preprocessing ของ checkpoint ให้
+  double _mouthScale = 2.4;
+  // ขนาดภาพที่โมเดลรับ ย่อตั้งแต่ฝั่งแอปเลย จะได้ไม่ต้องส่งภาพใหญ่เกินจำเป็น
+  // ข้ามเน็ตไปให้ server ย่อทีหลัง
+  int _roiSize = 112;
+  // จำนวนเฟรมที่โมเดลรับต่อหนึ่งคลิป
+  int _modelFrameCount = 16;
 
   // ขนาดด้านของกรอบครอป เฉลี่ยแบบถ่วงน้ำหนักตลอดหนึ่งประโยค (null = เริ่มใหม่)
   //
@@ -199,10 +209,35 @@ class _ScannerScreenState extends State<ScannerScreen>
     // _isApiAvailable เปลี่ยนกลางคันขณะ flow กำลังทำงาน
     if (_isPredicting) return;
     final available = await LipReadingApiService.checkHealth();
-    if (mounted && available != _isApiAvailable) {
+    if (!mounted) return;
+
+    if (available != _isApiAvailable) {
       setState(() => _isApiAvailable = available);
       debugPrint(available ? '✅ API Server พร้อมใช้งาน' : '⚠️ API Server ไม่พร้อม — ใช้โหมดสุ่มคำแทน');
     }
+    if (available) await _syncModelConfig();
+  }
+
+  /// ถามค่า preprocessing จาก server แล้วใช้ค่านั้นแทนค่าสำรองที่ฝังไว้
+  ///
+  /// ถามซ้ำทุกครั้งที่เช็ก health เพราะ server เปลี่ยนไฟล์โมเดลได้ระหว่างที่
+  /// แอปยังเปิดอยู่ ถามไม่ได้ก็ใช้ค่าเดิมต่อไป ไม่ต้องทำอะไร
+  Future<void> _syncModelConfig() async {
+    final config = await LipReadingApiService.fetchWordModelConfig();
+    if (config == null || !mounted) return;
+
+    final scale = config.mouthScale ?? _mouthScale;
+    if (config.frames == _modelFrameCount &&
+        config.roi == _roiSize &&
+        scale == _mouthScale) {
+      return;
+    }
+
+    debugPrint('⚙️ ปรับค่าตามโมเดลบน server: $config '
+        '(เดิม frames=$_modelFrameCount roi=$_roiSize scale=$_mouthScale)');
+    _modelFrameCount = config.frames;
+    _roiSize = config.roi;
+    _mouthScale = scale;
   }
 
   Future<void> _initCamera() async {

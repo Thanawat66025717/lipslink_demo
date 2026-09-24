@@ -73,6 +73,29 @@ class LipReadingApiService {
     }
   }
 
+  /// ถามค่า preprocessing ที่โมเดลบน server ต้องการจริงๆ
+  ///
+  /// ค่าพวกนี้ต้องตรงกับตอนเทรนเป๊ะ และเปลี่ยนได้ทุกครั้งที่เปลี่ยนไฟล์โมเดล
+  /// ถ้าฝั่งแอปฝังค่าไว้ตายตัว วันที่โมเดลรุ่นใหม่ใช้ค่าอื่น แอปจะส่งของผิด
+  /// ขนาดไปให้ server ย่อให้เงียบๆ แล้วทำนายมั่วโดยไม่มี error ฟ้อง
+  ///
+  /// คืน null เมื่อถามไม่ได้ ให้ผู้เรียกใช้ค่าสำรองของตัวเองต่อไป
+  static Future<WordModelConfig?> fetchWordModelConfig() async {
+    try {
+      final response = await http
+          .get(Uri.parse('$_baseUrl/word_model_info'))
+          .timeout(_timeout);
+      if (response.statusCode != 200) return null;
+
+      final data =
+          jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
+      return WordModelConfig.fromJson(data);
+    } catch (e) {
+      debugPrint('word_model_info failed: $e');
+      return null;
+    }
+  }
+
   /// ดูรายชื่อโมเดลที่มีบน Server
   static Future<Map<String, dynamic>?> getModels() async {
     try {
@@ -88,6 +111,50 @@ class LipReadingApiService {
       return null;
     }
   }
+}
+
+/// ค่า preprocessing ที่โมเดลบน server ต้องการ อ่านจากไฟล์ checkpoint โดยตรง
+class WordModelConfig {
+  /// จำนวนเฟรมต่อหนึ่งคลิป
+  final int frames;
+
+  /// ความกว้าง/สูงของภาพปากที่โมเดลรับ (จัตุรัส)
+  final int roi;
+
+  /// อัตราขยายกรอบครอบปาก — ปกติ checkpoint ยังไม่ได้บอกค่านี้มา
+  /// จะมีค่าก็ต่อเมื่อผู้เทรนใส่ `mouth_scale` ลงใน preprocessing ให้
+  final double? mouthScale;
+
+  const WordModelConfig({
+    required this.frames,
+    required this.roi,
+    this.mouthScale,
+  });
+
+  /// คืน null ถ้าค่าที่ได้มาอยู่นอกช่วงที่สมเหตุสมผล ดีกว่ารับค่าพังมาใช้
+  /// แล้วทำให้แอปส่งภาพขนาดประหลาดไปทั้ง session
+  static WordModelConfig? fromJson(Map<String, dynamic> json) {
+    final frames = (json['frames'] as num?)?.toInt();
+    final roi = (json['roi'] as num?)?.toInt();
+    if (frames == null || roi == null) return null;
+    if (frames < 2 || frames > 64) return null;
+    if (roi < 32 || roi > 512) return null;
+
+    final pre = json['preprocessing'];
+    final scale = pre is Map<String, dynamic>
+        ? (pre['mouth_scale'] as num?)?.toDouble()
+        : null;
+
+    return WordModelConfig(
+      frames: frames,
+      roi: roi,
+      mouthScale: (scale != null && scale >= 1.0 && scale <= 6.0) ? scale : null,
+    );
+  }
+
+  @override
+  String toString() => 'frames=$frames roi=$roi'
+      '${mouthScale != null ? ' mouthScale=$mouthScale' : ''}';
 }
 
 /// คำที่โมเดลเดาได้หนึ่งตัวเลือก พร้อมความมั่นใจ
