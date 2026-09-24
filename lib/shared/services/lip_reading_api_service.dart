@@ -41,6 +41,8 @@ class LipReadingApiService {
   static Future<WordPrediction?> predictWord(
     List<Uint8List> frames, {
     int topK = 3,
+    int? captureMs,
+    bool? isFinal,
   }) async {
     if (frames.isEmpty) return null;
 
@@ -52,6 +54,8 @@ class LipReadingApiService {
             body: jsonEncode({
               'frames': frames.map(base64Encode).toList(),
               'top_k': topK,
+              if (captureMs != null) 'capture_ms': captureMs,
+              if (isFinal != null) 'is_final': isFinal,
             }),
           )
           .timeout(_timeout);

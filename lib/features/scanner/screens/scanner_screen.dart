@@ -123,6 +123,8 @@ class _ScannerScreenState extends State<ScannerScreen>
   static const int _partialPredictEveryFrames = 6;
   int _framesAtLastPartial = 0;
   Future<void>? _partialInFlight;
+  // เวลาที่เริ่มเก็บเฟรมของประโยคปัจจุบัน ใช้คำนวณว่ากล้องเก็บได้กี่เฟรม/วินาที
+  DateTime? _captureStartedAt;
   Timer? _apiStatusTimer;
   static const Duration _apiStatusRecheckInterval = Duration(seconds: 20);
   // จำนวน frames สูงสุดที่เก็บต่อการพูด 1 รอบ
@@ -758,6 +760,7 @@ class _ScannerScreenState extends State<ScannerScreen>
     // 🟢 เคลียร์ frames ที่เก็บไว้
     _collectedLipFrames = [];
     _framesAtLastPartial = 0;
+    _captureStartedAt = DateTime.now();
 
     if (!_isApiAvailable) {
       // Fallback: ใช้คำสุ่มเมื่อ API ไม่พร้อม
@@ -811,6 +814,13 @@ class _ScannerScreenState extends State<ScannerScreen>
   /// พูดอยู่ ไม่ต้องรอจนพูดจบ
   void _maybePredictPartial() {
     if (_isPredicting) return;
+
+    // ยังไม่ครบจำนวนเฟรมที่โมเดลรับ ก็ยังไม่ต้องยิง — ถ้ายิงไปตอนนี้ server
+    // จะเติมเฟรมสุดท้ายซ้ำจนครบ ซึ่งเฟรมที่ซ้ำกันไม่มีการขยับ ค่า motion เลย
+    // ตกลงเกือบสี่เท่า (วัดได้ 0.047 -> 0.013) และ confidence ตกตาม
+    // ผลระหว่างทางเลยถูกปฏิเสธเกือบทุกครั้ง เสียเวลาเปล่าทั้งสองฝั่ง
+    if (_collectedLipFrames.length < _modelFrameCount) return;
+
     if (_collectedLipFrames.length - _framesAtLastPartial <
         _partialPredictEveryFrames) {
       return;
@@ -819,15 +829,25 @@ class _ScannerScreenState extends State<ScannerScreen>
     _partialInFlight = _predictPartial();
   }
 
+  /// เวลาที่ใช้เก็บเฟรมชุดปัจจุบัน ส่งไปให้ server บันทึกไว้ดูอัตราเฟรมต่อวินาที
+  int? get _captureMs => _captureStartedAt == null
+      ? null
+      : DateTime.now().difference(_captureStartedAt!).inMilliseconds;
+
   Future<void> _predictPartial() async {
     if (_isPredicting) return;
     _isPredicting = true;
 
     // สำเนา ณ ขณะนี้ เพราะรายการจริงยังโตต่อระหว่างที่รอผลอยู่
     final snapshot = _framesForModel(List<Uint8List>.of(_collectedLipFrames));
+    final captureMs = _captureMs;
 
     try {
-      final result = await LipReadingApiService.predictWord(snapshot);
+      final result = await LipReadingApiService.predictWord(
+        snapshot,
+        captureMs: captureMs,
+        isFinal: false,
+      );
 
       // แสดงเฉพาะตอนที่ยังพูดอยู่ ถ้าจบไปแล้วปล่อยให้ผลสุดท้ายเป็นตัวตัดสิน
       //
@@ -904,6 +924,8 @@ class _ScannerScreenState extends State<ScannerScreen>
     try {
       final result = await LipReadingApiService.predictWord(
         _framesForModel(_collectedLipFrames),
+        captureMs: _captureMs,
+        isFinal: true,
       );
 
       // ดู top-3 เต็มๆ ได้ที่ console ของ server เมื่อเปิด VOCALIP_DEBUG=1

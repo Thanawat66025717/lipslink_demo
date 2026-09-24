@@ -6,8 +6,10 @@ FastAPI server สำหรับรับ lip frames จากแอป Flutter
 import os
 import sys
 import io
+import csv
 import base64
 import time
+from datetime import datetime
 import numpy as np
 import cv2
 import torch
@@ -186,6 +188,11 @@ class WordPredictRequest(BaseModel):
     top_k: Optional[int] = 3
     # เปิด debug เฉพาะ request นี้ โดยไม่ต้องรีสตาร์ท server ด้วย VOCALIP_DEBUG
     debug: Optional[bool] = None
+    # เวลาที่ใช้เก็บเฟรมทั้งชุด (มิลลิวินาที) — บอกได้ว่ากล้องเก็บได้กี่เฟรม
+    # ต่อวินาที ซึ่งต้องใกล้เคียงกับตอนเทรน ไม่งั้นโมเดลเห็นปากขยับคนละความเร็ว
+    capture_ms: Optional[int] = None
+    # False = ผลระหว่างพูด, True = ผลตอนพูดจบ ใช้แยกแถวใน log ตอนวัดความแม่น
+    is_final: Optional[bool] = None
 
 
 class WordCandidate(BaseModel):
@@ -451,6 +458,33 @@ def _mouth_motion(frames: np.ndarray) -> float:
     return float(diff.mean())
 
 
+PREDICTION_LOG = os.path.join(DEBUG_DIR, "predictions.csv")
+
+_PREDICTION_LOG_HEADER = [
+    "time", "is_final", "top1", "conf1", "top2", "conf2", "top3", "conf3",
+    "margin", "motion", "accepted", "reject_reasons",
+    "frames_received", "capture_ms", "capture_fps",
+]
+
+
+def _log_prediction(row: dict) -> None:
+    """ต่อท้ายผลทำนายทุกครั้งลง csv ไว้วัดความแม่นทีหลัง
+
+    เขียนด้วย utf-8-sig เพื่อให้ Excel เปิดแล้วอ่านภาษาไทยออก ไม่ใช่ตัวขยะ
+    ล้มเหลวเงียบๆ ได้ เพราะ log พังไม่ควรทำให้ทำนายไม่ได้
+    """
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        is_new = not os.path.exists(PREDICTION_LOG)
+        with open(PREDICTION_LOG, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=_PREDICTION_LOG_HEADER)
+            if is_new:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as e:
+        print(f"⚠️ เขียน prediction log ไม่สำเร็จ: {e}", flush=True)
+
+
 def _save_debug_frames(frames: np.ndarray) -> dict:
     """เซฟภาพ mouth ROI ที่ server ได้รับจริงลง server/debug/ ไว้เปิดดูด้วยตา
 
@@ -597,6 +631,26 @@ async def predict_word(request: WordPredictRequest):
         reasons.append("margin")
     if gate_on and motion < gate_threshold:
         reasons.append("motion")
+
+    def _cand(i: int, field: str):
+        return getattr(candidates[i], field) if i < len(candidates) else ""
+
+    fps = (round(len(request.frames) / (request.capture_ms / 1000.0), 1)
+           if request.capture_ms else "")
+    _log_prediction({
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "is_final": request.is_final if request.is_final is not None else "",
+        "top1": _cand(0, "word"), "conf1": _cand(0, "confidence"),
+        "top2": _cand(1, "word"), "conf2": _cand(1, "confidence"),
+        "top3": _cand(2, "word"), "conf3": _cand(2, "confidence"),
+        "margin": round(margin, 4),
+        "motion": round(motion, 6),
+        "accepted": not reasons,
+        "reject_reasons": "|".join(reasons),
+        "frames_received": len(request.frames),
+        "capture_ms": request.capture_ms if request.capture_ms else "",
+        "capture_fps": fps,
+    })
 
     return WordPredictResponse(
         word=candidates[0].word,
