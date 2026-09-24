@@ -79,6 +79,19 @@ class _ScannerScreenState extends State<ScannerScreen>
   // จำนวนเฟรมที่โมเดลรับต่อหนึ่งคลิป
   int _modelFrameCount = 16;
 
+  // ช่วงเวลาที่คลิปหนึ่งควรครอบคลุม ราวหนึ่งคำพูด — ตอนเทรน 16 เฟรมมาจาก
+  // วิดีโอต่อเนื่องซึ่งกินเวลาราวเท่านี้ ถ้าเก็บนานกว่านี้ โมเดลจะเห็นปากขยับ
+  // ช้ากว่าที่เรียนรู้มา และคำจริงจะถูกเจือจางด้วยช่วงที่ปากขยับหลังพูดจบ
+  static const int _targetCaptureMs = 900;
+
+  // กรอบปากล่าสุดที่ ML Kit ตรวจได้ ใช้ครอปเฟรมระหว่างรอการตรวจรอบถัดไป
+  Rect? _lastMouthRoi;
+  DateTime? _lastMouthRoiAt;
+  // เก่ากว่านี้ถือว่าเชื่อไม่ได้แล้ว เพราะหน้าอาจเลื่อนไปไกลจนครอปผิดที่
+  static const Duration _mouthRoiMaxAge = Duration(milliseconds: 600);
+  // กันไม่ให้การเข้ารหัส PNG ซ้อนกัน และทำให้เฟรมเรียงตามเวลาเสมอ
+  bool _isCollecting = false;
+
   // ขนาดด้านของกรอบครอป เฉลี่ยแบบถ่วงน้ำหนักตลอดหนึ่งประโยค (null = เริ่มใหม่)
   //
   // กรอบดิบที่คำนวณจาก contour ทุกเฟรมมีขนาดแกว่งแรงมาก: มันโตตามตอนอ้าปาก
@@ -296,11 +309,24 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 
   Future<void> _onCameraFrame(CameraImage image) async {
+    final camera = _cameras[_isFrontCamera ? 1 : 0];
+
+    // ─── เส้นทางเร็ว: เก็บภาพปากทุกเฟรมกล้อง ไม่ต้องรอ ML Kit ───────────────
+    //
+    // ML Kit ตรวจใบหน้าได้แค่ราว 2 เฟรม/วินาทีบนมือถือจริง (วัดแล้ว) ถ้าผูก
+    // การเก็บภาพไว้กับมัน 16 เฟรมจะกินเวลา 7.5 วินาที ขณะที่ 16 เฟรมตอนเทรน
+    // กินราว 0.6 วินาที โมเดลจึงเห็นปากขยับช้ากว่าที่เรียนรู้มาสิบกว่าเท่า
+    // ซึ่งเป็นข้อมูลหลักที่มันใช้ตัดสิน
+    //
+    // ทำได้เพราะกรอบปากเลื่อนช้ากว่าการอ้า-หุบปากมาก ใช้กรอบที่ ML Kit ตรวจได้
+    // ล่าสุดครอปเฟรมระหว่างทางจึงยอมรับได้ ส่วนจังหวะอ้า-หุบเก็บครบทุกเฟรม
+    _maybeCollectFrame(image, camera.sensorOrientation);
+
+    // ─── เส้นทางช้า: ML Kit ทำได้ทีละงาน เฟรมที่มาระหว่างนั้นข้ามไป ──────────
     if (_isProcessingFrame) return;
     _isProcessingFrame = true;
 
     try {
-      final camera = _cameras[_isFrontCamera ? 1 : 0];
       final inputImage = _buildInputImage(image, camera);
       if (inputImage == null) {
         _isProcessingFrame = false;
@@ -329,19 +355,11 @@ class _ScannerScreenState extends State<ScannerScreen>
         final mouthOpen = _estimateMouthOpen(face);
         _updateMouthState(mouthOpen, faceDetected: true, smiling: prob > 0.6);
 
-        // 🟢 เก็บ lip frames ขณะกำลังพูด (สำหรับส่งไป API)
-        if (_state == _SpeakingState.speaking && _isApiAvailable && _collectedLipFrames.length < _maxCollectFrames) {
-          // ส่ง sensorOrientation ไปด้วย เพราะพิกัดที่ ML Kit คืนมาอยู่ในภาพ
-          // ที่หมุนตั้งแล้ว แต่พิกเซลที่ต้องอ่านอยู่ในบัฟเฟอร์ที่ยังไม่หมุน
-          await _collectLipFrame(image, face, camera.sensorOrientation);
-          // ถ้าเก็บครบ cap แล้วแต่ยังพูดต่อไม่หยุด ส่งเท่าที่มีไปประมวลผลเลย
-          // ดีกว่าปล่อยให้ผู้ใช้รอเก้อจนกว่าจะตรวจพบว่าหยุดพูดจริง (frame ส่วน
-          // ที่เกินมาจะไม่ถูกเก็บต่ออยู่ดี ไม่มีประโยชน์ที่จะรอเฉยๆ)
-          if (_collectedLipFrames.length >= _maxCollectFrames) {
-            _finalizeUtterance();
-          } else {
-            _maybePredictPartial();
-          }
+        // เก็บกรอบปากไว้ให้เส้นทางเร็วใช้ครอปเฟรมถัดๆ ไปจนกว่าจะตรวจรอบใหม่
+        final roi = _mouthRoiRect(face);
+        if (roi != null) {
+          _lastMouthRoi = roi;
+          _lastMouthRoiAt = DateTime.now();
         }
       }
     } catch (e) {
@@ -351,30 +369,54 @@ class _ScannerScreenState extends State<ScannerScreen>
     _isProcessingFrame = false;
   }
 
-  /// เก็บภาพปาก 1 เฟรมเป็นภาพสี 112x112 ตรงตามที่โมเดล 44 คำถูกเทรนมา
+  /// เก็บภาพปากจากเฟรมกล้องนี้ ถ้ากรอบปากที่ ML Kit ตรวจไว้ยังใหม่พอ
   ///
-  /// สามอย่างที่ต่างจากเวอร์ชันก่อน และจำเป็นทั้งสามอย่าง:
-  /// - ครอปจากเส้น contour ริมฝีปากจริงคูณ 2.4 ไม่ใช่เดาสัดส่วนจาก bounding box
-  /// - แปลงพิกัดจากระบบของ ML Kit (ภาพที่หมุนตั้งแล้ว) กลับมาที่บัฟเฟอร์ดิบ
-  ///   ก่อนอ่านพิกเซล ของเดิมอ่านตรงๆ จึงครอปผิดตำแหน่งไปคนละที่เมื่อกล้อง
-  ///   หมุน 90/270 องศา ซึ่งเป็นค่าปกติของกล้องหน้าบนมือถือ
-  /// - อ่าน U/V ด้วย ไม่ใช่แค่ Y เพราะโมเดลรับภาพ 3 ช่องสี ของเดิมส่งขาวดำไป
-  ///   ซึ่ง server รันผ่านโดยไม่ error แต่โมเดลตอบมั่ว
-  Future<void> _collectLipFrame(
-      CameraImage image, Face face, int rotationDegrees) async {
-    try {
-      final roi = _mouthRoiRect(face);
-      if (roi == null) return;
+  /// ไม่ await เพราะถูกเรียกจาก callback ของสตรีมกล้องที่ยิงมาเรื่อยๆ —
+  /// ใช้ธงกันไม่ให้ซ้อนกันแทน เฟรมที่มาระหว่างที่ยังเข้ารหัสไม่เสร็จก็ข้ามไป
+  void _maybeCollectFrame(CameraImage image, int rotationDegrees) {
+    if (_isCollecting) return;
+    if (_state != _SpeakingState.speaking) return;
+    if (!_isApiAvailable) return;
+    if (_collectedLipFrames.length >= _maxCollectFrames) return;
 
-      final rgba = _cropMouthToRgba(image, roi, rotationDegrees);
-      if (rgba == null) return;
+    final roi = _lastMouthRoi;
+    final detectedAt = _lastMouthRoiAt;
+    if (roi == null || detectedAt == null) return;
+    // กรอบเก่าเกินไปแปลว่าหน้าอาจเลื่อนไปแล้ว รอ ML Kit ตรวจใหม่ดีกว่าครอปมั่ว
+    if (DateTime.now().difference(detectedAt) > _mouthRoiMaxAge) return;
 
-      // ต้อง encode เป็นไฟล์ PNG จริง — server ถอดรหัสด้วย cv2.imdecode/PIL
-      // ซึ่งอ่าน raw pixel bytes ไม่ออก
-      _collectedLipFrames.add(await _encodeRgbaPng(rgba, _roiSize, _roiSize));
-    } catch (e) {
-      debugPrint('Lip frame collection error: $e');
-    }
+    // ครอปแบบ synchronous ก่อน จะได้ไม่ถือ CameraImage ข้าม await
+    // แล้วค่อยเข้ารหัส PNG แบบ async ซึ่งเป็นส่วนที่ช้ากว่า
+    final rgba = _cropMouthToRgba(image, roi, rotationDegrees);
+    if (rgba == null) return;
+
+    _isCollecting = true;
+    _encodeRgbaPng(rgba, _roiSize, _roiSize).then((png) {
+      _collectedLipFrames.add(png);
+    }).catchError((Object e) {
+      debugPrint('Lip frame encode error: $e');
+    }).whenComplete(() {
+      _isCollecting = false;
+      if (!mounted || _state != _SpeakingState.speaking) return;
+      if (_shouldFinalizeCapture()) {
+        _finalizeUtterance();
+      } else {
+        _maybePredictPartial();
+      }
+    });
+  }
+
+  /// เก็บครบสำหรับหนึ่งคำแล้วหรือยัง
+  ///
+  /// ตัดสินด้วย "ช่วงเวลา" เป็นหลัก ไม่ใช่จำนวนเฟรม เพราะอัตราเฟรมต่างกันมาก
+  /// ระหว่างเครื่อง (วัดได้ 2 fps บนมือถือจริง กับ 7 fps บนอีมูเลเตอร์) ถ้าใช้
+  /// จำนวนเฟรมเป็นเกณฑ์ ช่วงเวลาที่โมเดลเห็นจะไม่เท่ากันในแต่ละเครื่อง ทั้งที่
+  /// มันต้องใกล้เคียงกับตอนเทรน (16 เฟรมต่อคำ ราว 0.6 วินาที)
+  bool _shouldFinalizeCapture() {
+    if (_collectedLipFrames.length >= _maxCollectFrames) return true;
+    if (_collectedLipFrames.length < _modelFrameCount) return false;
+    final elapsed = _captureMs;
+    return elapsed != null && elapsed >= _targetCaptureMs;
   }
 
   /// กรอบจัตุรัสรอบปาก ในระบบพิกัดเดียวกับที่ ML Kit คืนค่ามา
