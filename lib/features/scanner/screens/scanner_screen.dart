@@ -1507,6 +1507,7 @@ class _FaceOverlayPainter extends CustomPainter {
       return;
     }
 
+    _logGeometryOnce(size);
     for (final face in faces) {
       _drawFaceTracking(canvas, size, face);
     }
@@ -1646,9 +1647,15 @@ class _FaceOverlayPainter extends CustomPainter {
     return Rect.fromLTRB(left, top, right, bottom);
   }
 
+  /// แปลงจุดจาก ML Kit มาเป็นพิกัดบนผืนวาด ให้ตรงกับที่ CameraPreview วาดจริง
+  ///
+  /// ของเดิมยืดพิกัดให้เต็มผืนวาดด้วยอัตราส่วนคนละค่าในแนวนอนกับแนวตั้ง แต่
+  /// CameraPreview รักษาสัดส่วนภาพไว้ (จึงมีแถบดำคั่น) ภาพจริงเลยกินพื้นที่แค่
+  /// ส่วนกลาง ผลคือจุดตรงพอดีเฉพาะตอนหน้าอยู่กลางจอ และเพี้ยนมากขึ้นเรื่อยๆ
+  /// เมื่อหน้าเลื่อนออกไปทางขอบ
   Offset _scalePoint(Point<int> point, Size widgetSize) {
-    double imageW, imageH;
-
+    // ML Kit ให้พิกัดในภาพที่หมุนตั้งแล้ว ซึ่งเป็นภาพเดียวกับที่ preview แสดง
+    final double imageW, imageH;
     if (rotation == InputImageRotation.rotation90deg ||
         rotation == InputImageRotation.rotation270deg) {
       imageW = imageSize.height;
@@ -1658,15 +1665,23 @@ class _FaceOverlayPainter extends CustomPainter {
       imageH = imageSize.height;
     }
 
-    final scaleX = widgetSize.width / imageW;
-    final scaleY = widgetSize.height / imageH;
+    // อัตราส่วนเดียวกันทั้งสองแกน แล้วเลื่อนให้อยู่กลางเหมือนที่ preview วาง
+    final scale = min(widgetSize.width / imageW, widgetSize.height / imageH);
+    final dx = (widgetSize.width - imageW * scale) / 2;
+    final dy = (widgetSize.height - imageH * scale) / 2;
 
-    // 🟢 เหตุผลเดียวกับ _getFaceRect — ไม่ flip ที่นี่แล้ว เพราะ Transform
-    // ระดับ widget ด้านนอกจัดการ mirror ให้ทั้ง preview และ overlay พร้อมกัน
-    final x = point.x.toDouble() * scaleX;
-    final y = point.y.toDouble() * scaleY;
+    return Offset(dx + point.x * scale, dy + point.y * scale);
+  }
 
-    return Offset(x, y);
+  /// พิมพ์ขนาดจริงครั้งเดียว ไว้ตรวจว่าการแปลงพิกัดข้างบนตั้งสมมติฐานถูกมั้ย
+  static bool _loggedGeometry = false;
+  void _logGeometryOnce(Size widgetSize) {
+    if (_loggedGeometry) return;
+    _loggedGeometry = true;
+    debugPrint('📐 overlay: canvas=${widgetSize.width.toStringAsFixed(0)}x'
+        '${widgetSize.height.toStringAsFixed(0)} '
+        'image=${imageSize.width.toStringAsFixed(0)}x'
+        '${imageSize.height.toStringAsFixed(0)} rotation=$rotation');
   }
 
   @override
