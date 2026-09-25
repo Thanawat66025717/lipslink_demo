@@ -87,7 +87,10 @@ class _ScannerScreenState extends State<ScannerScreen>
   Rect? _lastMouthRoi;
   DateTime? _lastMouthRoiAt;
   // เก่ากว่านี้ถือว่าเชื่อไม่ได้แล้ว เพราะหน้าอาจเลื่อนไปไกลจนครอปผิดที่
-  static const Duration _mouthRoiMaxAge = Duration(milliseconds: 600);
+  //
+  // ต้องยาวพอคลุมทั้งประโยค (ราว 1 วินาที) เพราะระหว่างเก็บเฟรมเราหยุดตรวจหน้า
+  // กรอบจึงไม่ถูกรีเฟรชเลยตลอดช่วงนั้น หัวคนขยับไม่กี่พิกเซลในเวลาเท่านี้
+  static const Duration _mouthRoiMaxAge = Duration(milliseconds: 1500);
   // กันไม่ให้การครอปซ้อนกัน และทำให้เฟรมเรียงตามเวลาเสมอ
   bool _isCollecting = false;
   DateTime? _lastCollectAt;
@@ -111,7 +114,12 @@ class _ScannerScreenState extends State<ScannerScreen>
   Duration _silenceGap = const Duration(milliseconds: 800);
   int _consecutiveSilenceFrames = 0;
   int _consecutiveSpeakFrames = 0;
-  static const int _speakFrameThreshold = 3;
+  // ต้องตรวจเจอปากอ้ากี่ครั้งติดกันถึงจะถือว่าเริ่มพูด — นับเป็น "ครั้งที่ตรวจ"
+  // ไม่ใช่เฟรมกล้อง และการตรวจทำได้ราว 3 ครั้งต่อวินาที ค่า 3 จึงแปลว่ารอเกือบ
+  // หนึ่งวินาทีก่อนเริ่มเก็บ ซึ่งคำพูดอาจจบไปแล้ว ลดเหลือ 2 เพื่อให้เริ่มทัน
+  // แลกกับการเริ่มเก็บผิดบ้างเวลาผู้ใช้อ้าปากโดยไม่ได้พูด ซึ่ง motion gate
+  // และเกณฑ์ confidence ฝั่ง server คัดออกให้อยู่แล้ว
+  static const int _speakFrameThreshold = 2;
   static const int _silenceFrameThreshold = 8;
 
   // ─── Output ───────────────────────────────────────────────────────────────
@@ -328,6 +336,20 @@ class _ScannerScreenState extends State<ScannerScreen>
     _maybeCollectFrame(image, camera.sensorOrientation);
 
     // ─── เส้นทางช้า: ML Kit ทำได้ทีละงาน เฟรมที่มาระหว่างนั้นข้ามไป ──────────
+    //
+    // ระหว่างที่กำลังเก็บเฟรมของประโยคหนึ่งอยู่ ให้หยุดตรวจหน้าไปเลย เพราะเรา
+    // มีกรอบปากอยู่แล้วและไม่ได้ใช้ผลตรวจทำอะไรในช่วงนั้น (การจบประโยคใช้เวลา
+    // เป็นเกณฑ์ ไม่ได้รอให้ตรวจเจอว่าหุบปาก)
+    //
+    // การตรวจหนึ่งรอบต้องแปลงทั้งเฟรมเป็น NV21 ก่อน ซึ่งวนทุกพิกเซลใน Dart
+    // และบล็อก isolate จนการเก็บภาพปากแทรกไม่ได้ ผลคือเก็บได้จริงราว 5 เฟรม
+    // ต่อวินาทีทั้งที่ตั้งเพดานไว้ 20 พอหยุดตรวจชั่วคราว เวลาทั้งหมดในช่วงนั้น
+    // จึงเหลือให้การเก็บภาพอย่างเดียว
+    if (_state == _SpeakingState.speaking &&
+        _collectedLipFrames.length < _modelFrameCount) {
+      return;
+    }
+
     if (_isProcessingFrame) return;
     _isProcessingFrame = true;
 
@@ -1007,7 +1029,9 @@ class _ScannerScreenState extends State<ScannerScreen>
       _collectedLipFrames = [];
       if (mounted) {
         setState(() => _isPredicting = false);
-        Future.delayed(const Duration(seconds: 4), () {
+        // กลับไปพร้อมรับคำถัดไปให้เร็ว ผลที่แสดงยังอยู่บนจอต่อไปจนกว่าจะมีคำใหม่
+        // เดิมรอ 4 วินาที ซึ่งเป็นช่วงที่พูดคำต่อไปแล้วแอปไม่รับรู้เลย
+        Future.delayed(const Duration(milliseconds: 600), () {
           if (mounted) setState(() => _state = _SpeakingState.idle);
         });
       }
