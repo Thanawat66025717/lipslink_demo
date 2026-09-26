@@ -161,7 +161,25 @@ async def load_models():
         except Exception as e:
             print(f"❌ Failed to load {filename}: {e}")
     else:
+        # บอกให้ชัดว่าเจอไฟล์อะไร ฟอร์แมตอะไร และเรารองรับอะไร — ไม่งั้นเวลา
+        # ผู้เทรนส่ง checkpoint ฟอร์แมตใหม่มา server จะเงียบเฉยๆ แล้วต้องมานั่ง
+        # เดาว่าไฟล์หาย ไฟล์พัง หรือชื่อผิด
         print("⚠️ ไม่พบ checkpoint โมเดลทำนายคำที่อ่านได้ใน server/models/")
+        if deployment_files:
+            print(f"   เจอไฟล์ {len(deployment_files)} ไฟล์ แต่อ่านฟอร์แมตไม่ได้:")
+            for f in deployment_files:
+                try:
+                    fmt = torch.load(
+                        os.path.join(MODEL_DIR, f),
+                        map_location="cpu", weights_only=False,
+                    ).get("format", "(ไม่มีคีย์ format)")
+                except Exception as e:
+                    fmt = f"(เปิดไม่ได้: {e})"
+                print(f"     {f}  ->  format={fmt!r}")
+            print("   ฟอร์แมตที่รองรับ: 'VocaLip-44word-real-lipreading-v1', "
+                  "'VocaLipThai-44Word-v1'")
+        else:
+            print("   ไม่มีไฟล์ที่ลงท้ายด้วย _deployment.pt เลย")
 
     if not models:
         print("⚠️ No models loaded! Place .pt files in server/models/")
