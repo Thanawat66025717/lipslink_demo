@@ -799,6 +799,17 @@ async def word_model_info():
     # โมเดล ถ้าวันหนึ่งผู้เทรนใส่ mouth_scale มาใน checkpoint ค่านั้นจะถูกใช้เอง
     if MOUTH_SCALE_OVERRIDE is not None:
         pre["mouth_scale"] = MOUTH_SCALE_OVERRIDE
+
+    # เดิมส่งค่า rejection ดิบจาก checkpoint ตรงๆ ทำให้ตัวเลขที่แสดงตรงนี้กับ
+    # ค่าที่ /predict_word ใช้จริงไม่ตรงกันเวลาตั้ง VOCALIP_MIN_CONFIDENCE ทับไว้
+    # (ตัวเลขจริงถูกอยู่แล้ว แค่ endpoint นี้โชว์ผิด) เอาค่าที่ใช้จริงมาแทนที่
+    rejection = dict(meta.get("rejection", {}))
+    if MIN_WORD_CONFIDENCE_ENV is not None:
+        rejection["confidence_threshold_start"] = MIN_WORD_CONFIDENCE_ENV
+        rejection["confidence_threshold_source"] = "VOCALIP_MIN_CONFIDENCE (env)"
+    else:
+        rejection["confidence_threshold_source"] = "checkpoint"
+
     return {
         "format": meta["format"],
         "config": meta.get("config", {}),
@@ -808,7 +819,7 @@ async def word_model_info():
         # รุ่น 05 ระบุ cache_channel_order มาตรงๆ ส่วนรุ่น 03 เขียนไว้กำกวมว่า
         # "cached order; no channel swap" จึงเติมค่าที่ยืนยันกับผู้เทรนแล้วให้
         "channel_order_resolved": pre.get("cache_channel_order", "BGR"),
-        "rejection": meta.get("rejection", {}),
+        "rejection": rejection,
         "motion_gate": meta.get("motion_gate", {}),
         # สูตรเดียวกับ motion_score() ใน Notebook 05 CELL 16
         "motion_metric": (
