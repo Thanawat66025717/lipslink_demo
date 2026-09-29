@@ -1271,24 +1271,38 @@ class _ScannerScreenState extends State<ScannerScreen>
     // ฟังการเปลี่ยนแปลงผ่าน ValueNotifier + RepaintBoundary แทนการ setState
     // ทั้งหน้าจอทุกเฟรมกล้อง ข้อมูลชุดนี้มีแค่ overlay ที่ใช้ จึงไม่มีเหตุผล
     // ให้ทั้งจอวาดใหม่ตามไปด้วยในอัตราเดียวกับกล้อง
+    //
+    // ครอบด้วย AnimatedBuilder ฟัง _pulseCtrl/_waveCtrl เพิ่ม — สองตัวนี้ถูก
+    // สร้างและวิ่งอยู่แล้วตั้งแต่ initState() แต่ไม่เคยมีใครอ่านค่ามันเลย จึงไม่มี
+    // อะไรในจอเคลื่อนไหวเลยสักจุด ตอนนี้ค่าปัจจุบันถูกส่งเข้าไปให้ painter วาด
+    // เป็นวงแสงหายใจ/ระลอกคลื่นรอบปาก
     return RepaintBoundary(
       child: LayoutBuilder(
         builder: (context, constraints) {
-          return ValueListenableBuilder<_FaceOverlayData>(
-            valueListenable: _overlayData,
-            builder: (context, data, _) {
-              return CustomPaint(
-                size: Size(constraints.maxWidth, constraints.maxHeight),
-                painter: _FaceOverlayPainter(
-                  faces: data.faces,
-                  imageSize: data.imageSize ?? const Size(480, 640),
-                  rotation: data.rotation ?? InputImageRotation.rotation0deg,
-                  canvasSize: Size(constraints.maxWidth, constraints.maxHeight),
-                  isFrontCamera: _isFrontCamera,
-                  isSpeaking: data.isSpeaking,
-                  faceDetected: data.faceDetected,
-                  mouthOpenProb: data.mouthOpenProb,
-                ),
+          return AnimatedBuilder(
+            animation: Listenable.merge([_pulseCtrl, _waveCtrl]),
+            builder: (context, _) {
+              return ValueListenableBuilder<_FaceOverlayData>(
+                valueListenable: _overlayData,
+                builder: (context, data, _) {
+                  return CustomPaint(
+                    size: Size(constraints.maxWidth, constraints.maxHeight),
+                    painter: _FaceOverlayPainter(
+                      faces: data.faces,
+                      imageSize: data.imageSize ?? const Size(480, 640),
+                      rotation:
+                          data.rotation ?? InputImageRotation.rotation0deg,
+                      canvasSize:
+                          Size(constraints.maxWidth, constraints.maxHeight),
+                      isFrontCamera: _isFrontCamera,
+                      isSpeaking: data.isSpeaking,
+                      faceDetected: data.faceDetected,
+                      mouthOpenProb: data.mouthOpenProb,
+                      pulseValue: _pulseCtrl.value,
+                      waveValue: _waveCtrl.value,
+                    ),
+                  );
+                },
               );
             },
           );
@@ -1335,6 +1349,14 @@ class _ScannerScreenState extends State<ScannerScreen>
     );
   }
 
+  // น้ำหนัก/ขนาดตัวอักษรเดียวกันทั้งสามปุ่ม — เดิม "บันทึก"/"Reset" ใช้ 10px
+  // น้ำหนักปกติ ส่วน "Voice" ใช้ 12px ตัวหนา ทำให้แถวเดียวกันดูไม่เป็นชุดเดียว
+  TextStyle _actionLabelStyle(bool enabled) => TextStyle(
+        fontSize: 12,
+        fontWeight: FontWeight.w600,
+        color: enabled ? AppTheme.textPrimary : AppTheme.textHint,
+      );
+
   Widget _buildActionRow() {
     // ผูกกับ _hasWord ไม่ใช่ "มีข้อความอยู่มั้ย" เพราะข้อความแจ้งว่าอ่านไม่ได้
     // ก็เป็นข้อความเหมือนกัน แต่ไม่ควรบันทึกลงประวัติหรือให้ TTS อ่านออกเสียง
@@ -1352,7 +1374,11 @@ class _ScannerScreenState extends State<ScannerScreen>
                 height: 48,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: Colors.white,
+                  // โทนฟ้าอ่อนแทนวงกลมขาวล้วน ให้ "บันทึก" อ่านว่าเป็นแอ็กชัน
+                  // ระดับข้อมูล/ฟ้า ต่างจาก Reset ที่เป็นแอ็กชันกลางๆ
+                  color: hasText
+                      ? AppTheme.primary.withOpacity(0.12)
+                      : Colors.white,
                   boxShadow: [
                     BoxShadow(
                         color: Colors.black.withOpacity(0.05), blurRadius: 10)
@@ -1364,10 +1390,7 @@ class _ScannerScreenState extends State<ScannerScreen>
               ),
             ),
             const SizedBox(height: 8),
-            Text('บันทึก',
-                style: TextStyle(
-                    fontSize: 10,
-                    color: hasText ? AppTheme.textPrimary : AppTheme.textHint)),
+            Text('บันทึก', style: _actionLabelStyle(hasText)),
           ],
         ),
         Column(
@@ -1380,13 +1403,15 @@ class _ScannerScreenState extends State<ScannerScreen>
                 height: 68,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: AppTheme.success,
+                  // ไล่เฉดจริงสองโทน (ดู successGradient) แทนสีทึบเดิม ให้ปุ่ม
+                  // หลักของแถวมีมิติความลึกแทนที่จะแบนเหมือนอีกสองปุ่ม
+                  gradient: AppTheme.successGradient,
                   boxShadow: hasText && !_isTtsSpeaking
                       ? [
                           BoxShadow(
-                              color: AppTheme.success.withOpacity(0.4),
-                              blurRadius: 15,
-                              offset: const Offset(0, 5))
+                              color: AppTheme.successDark.withOpacity(0.45),
+                              blurRadius: 18,
+                              offset: const Offset(0, 6))
                         ]
                       : [],
                 ),
@@ -1400,11 +1425,7 @@ class _ScannerScreenState extends State<ScannerScreen>
               ),
             ),
             const SizedBox(height: 8),
-            const Text('Voice',
-                style: TextStyle(
-                    fontSize: 12,
-                    color: AppTheme.textPrimary,
-                    fontWeight: FontWeight.w600)),
+            Text('Voice', style: _actionLabelStyle(true)),
           ],
         ),
         Column(
@@ -1421,7 +1442,9 @@ class _ScannerScreenState extends State<ScannerScreen>
                 height: 48,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: Colors.white,
+                  // โทนเทาอุ่นแทนวงกลมขาวล้วน แยกจาก "บันทึก" ด้วยสี ไม่ใช่แค่
+                  // ไอคอน — Reset เป็นแอ็กชันกลางๆ จึงใช้กลุ่มสีที่เงียบกว่า
+                  color: const Color(0xFFEEF0F3),
                   boxShadow: [
                     BoxShadow(
                         color: Colors.black.withOpacity(0.05), blurRadius: 10)
@@ -1432,8 +1455,7 @@ class _ScannerScreenState extends State<ScannerScreen>
               ),
             ),
             const SizedBox(height: 8),
-            const Text('Reset',
-                style: TextStyle(fontSize: 10, color: AppTheme.textPrimary)),
+            Text('Reset', style: _actionLabelStyle(true)),
           ],
         ),
       ],
@@ -1488,6 +1510,10 @@ class _FaceOverlayPainter extends CustomPainter {
   final bool isSpeaking;
   final bool faceDetected;
   final double mouthOpenProb;
+  // ค่าปัจจุบันของ _pulseCtrl (0..1 วนกลับไปมา) และ _waveCtrl (0..1 วนต่อเนื่อง)
+  // ใช้วาดวงแสงหายใจตอนเจอหน้าเฉยๆ กับระลอกคลื่นตอนกำลังพูด
+  final double pulseValue;
+  final double waveValue;
 
   _FaceOverlayPainter({
     required this.faces,
@@ -1498,6 +1524,8 @@ class _FaceOverlayPainter extends CustomPainter {
     required this.isSpeaking,
     required this.faceDetected,
     required this.mouthOpenProb,
+    required this.pulseValue,
+    required this.waveValue,
   });
 
   @override
@@ -1529,95 +1557,113 @@ class _FaceOverlayPainter extends CustomPainter {
     textPainter.paint(canvas, const Offset(16, 16));
   }
 
+  /// เดิมตรงนี้วาดข้อความเขียวนีออนสไตล์ debug computer-vision ("พบใบหน้า")
+  /// พร้อมเส้นตาข่ายพาดทับทั้งหน้า (คิ้ว-ตา-จมูก-ปาก) ซึ่งดูเหมือนถูกเครื่อง
+  /// สแกนมากกว่าแอปสื่อสารที่ควรรู้สึกอบอุ่น — เปลี่ยนเป็นชิปสถานะโทนขาวนวล
+  /// บวกวงแสงเฉพาะรอบปาก (จุดที่ผู้ใช้ต้องโฟกัสจริงๆ) แทน
   void _drawFaceTracking(Canvas canvas, Size size, Face face) {
-    // 1) Text "พบใบหน้า" or "กำลังพูด..."
-    final label = isSpeaking ? 'กำลังพูด...' : 'พบใบหน้า';
-    final textColor = isSpeaking ? const Color(0xFF4CAF50) : const Color(0xFF00FF00);
+    _drawStatusChip(canvas);
+    _drawMouthFocus(canvas, size, face);
+  }
+
+  void _drawStatusChip(Canvas canvas) {
+    final label = isSpeaking ? 'กำลังฟังอยู่...' : 'เจอหน้าคุณแล้ว';
+    final dotColor = isSpeaking ? AppTheme.successDark : AppTheme.success;
 
     final textPainter = TextPainter(
       text: TextSpan(
         text: label,
-        style: TextStyle(
-          color: textColor,
-          fontSize: 14,
+        style: const TextStyle(
+          color: AppTheme.textPrimary,
+          fontSize: 12,
           fontWeight: FontWeight.w600,
         ),
       ),
       textDirection: TextDirection.ltr,
     )..layout();
-    
-    textPainter.paint(canvas, const Offset(16, 16));
 
-    // 2) Contour Wireframe Mesh — เส้นตาข่ายตาม contour ของใบหน้า
-    final contourTypes = [
-      FaceContourType.face,
-      FaceContourType.leftEyebrowTop,
-      FaceContourType.leftEyebrowBottom,
-      FaceContourType.rightEyebrowTop,
-      FaceContourType.rightEyebrowBottom,
-      FaceContourType.leftEye,
-      FaceContourType.rightEye,
-      FaceContourType.noseBottom,
-      FaceContourType.noseBridge,
+    const dotRadius = 4.0;
+    const paddingH = 12.0;
+    const paddingV = 7.0;
+    const gap = 7.0;
+    final chipWidth = paddingH * 2 + dotRadius * 2 + gap + textPainter.width;
+    final chipHeight = paddingV * 2 + textPainter.height;
+    final chipRect = Rect.fromLTWH(12, 12, chipWidth, chipHeight);
+
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(chipRect, Radius.circular(chipHeight / 2)),
+      Paint()..color = Colors.white.withOpacity(0.92),
+    );
+
+    final dotCenter = Offset(
+      chipRect.left + paddingH + dotRadius,
+      chipRect.top + chipHeight / 2,
+    );
+    canvas.drawCircle(dotCenter, dotRadius, Paint()..color = dotColor);
+
+    textPainter.paint(
+      canvas,
+      Offset(dotCenter.dx + dotRadius + gap, chipRect.top + paddingV),
+    );
+  }
+
+  /// จุดกึ่งกลางริมฝีปาก เฉลี่ยจากจุด contour ทั้งสี่เส้น ใช้เป็นจุดยึดวาด
+  /// วงแสง/ระลอกคลื่น คืน null เมื่อหาไม่ได้ ซึ่งแปลว่าไม่ควรวาดเดามั่ว
+  Offset? _mouthCenter(Face face, Size size) {
+    const types = [
       FaceContourType.upperLipTop,
       FaceContourType.upperLipBottom,
       FaceContourType.lowerLipTop,
       FaceContourType.lowerLipBottom,
     ];
-
-    for (final type in contourTypes) {
-      final contour = face.contours[type];
-      if (contour == null || contour.points.isEmpty) continue;
-
-      final points = contour.points.map((p) => _scalePoint(p, size)).toList();
-
-      // กำหนดสีเป็นสีเขียวสไตล์ AI Vision
-      Color lineColor = const Color(0xFF00FF00); 
-      double lineWidth = 0.8;
-      double dotRadius = 1.5;
-      
-      final isLip = type == FaceContourType.upperLipTop ||
-          type == FaceContourType.upperLipBottom ||
-          type == FaceContourType.lowerLipTop ||
-          type == FaceContourType.lowerLipBottom;
-      final isEye = type == FaceContourType.leftEye ||
-          type == FaceContourType.rightEye;
-
-      if (isLip) {
-        lineColor = isSpeaking ? const Color(0xFF4CAF50) : const Color(0xFF00FF00);
-        lineWidth = 1.2;
-        dotRadius = 2.0;
-      } else if (isEye) {
-        lineWidth = 1.0;
-        dotRadius = 1.8;
-      }
-
-      // วาดเส้นเชื่อมจุด contour
-      final linePaint = Paint()
-        ..color = lineColor.withOpacity(0.5) // เส้นเขียวจางๆ
-        ..strokeWidth = lineWidth
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round;
-
-      if (points.length > 1) {
-        final path = Path()..moveTo(points.first.dx, points.first.dy);
-        for (int i = 1; i < points.length; i++) {
-          path.lineTo(points[i].dx, points[i].dy);
-        }
-        // ปิดเส้นสำหรับ ตา, ขอบหน้า
-        if (isEye || type == FaceContourType.face) {
-          path.close();
-        }
-        canvas.drawPath(path, linePaint);
-      }
-
-      // วาดจุดสีเขียว
-      final dotPaint = Paint()
-        ..color = lineColor
-        ..style = PaintingStyle.fill;
+    double sumX = 0, sumY = 0;
+    int count = 0;
+    for (final type in types) {
+      final points = face.contours[type]?.points;
+      if (points == null) continue;
       for (final p in points) {
-        canvas.drawCircle(p, dotRadius, dotPaint);
+        final s = _scalePoint(p, size);
+        sumX += s.dx;
+        sumY += s.dy;
+        count++;
       }
+    }
+    if (count == 0) return null;
+    return Offset(sumX / count, sumY / count);
+  }
+
+  void _drawMouthFocus(Canvas canvas, Size size, Face face) {
+    final center = _mouthCenter(face, size);
+    if (center == null) return;
+
+    // ยิ่งปากอ้ากว้าง วงแสงยิ่งใหญ่ขึ้น — ผูกกับข้อมูลจริงแทนที่จะเป็นแค่ตกแต่ง
+    final baseRadius = 22.0 + mouthOpenProb.clamp(0.0, 1.0) * 20.0;
+
+    final glowPaint = Paint()
+      ..color = AppTheme.primary.withOpacity(isSpeaking ? 0.28 : 0.16)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 18);
+    canvas.drawCircle(center, baseRadius, glowPaint);
+
+    if (isSpeaking) {
+      // ระลอกคลื่นขยายออกตอนกำลังพูด ขับเคลื่อนด้วย _waveCtrl ซึ่งวนต่อเนื่อง
+      // วาดสองวงเหลื่อมเฟสกันครึ่งรอบ ให้เห็นเป็นคลื่นไหลต่อเนื่องไม่ใช่วงเดียว
+      // กระตุกทุกครั้งที่วนรอบใหม่
+      for (final phase in [0.0, 0.5]) {
+        final t = (waveValue + phase) % 1.0;
+        final ringPaint = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.6
+          ..color = AppTheme.primary.withOpacity((1 - t) * 0.5);
+        canvas.drawCircle(center, baseRadius + t * 22, ringPaint);
+      }
+    } else {
+      // หายใจเบาๆ ตอนแค่เจอหน้าแต่ยังไม่พูด ขับเคลื่อนด้วย _pulseCtrl ซึ่งวน
+      // กลับไปมา (reverse) ให้รู้สึกว่าแอปยังทำงานอยู่แม้ผู้ใช้ยังไม่เริ่มพูด
+      final ringPaint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.6
+        ..color = AppTheme.primary.withOpacity(0.35);
+      canvas.drawCircle(center, baseRadius + pulseValue * 4, ringPaint);
     }
   }
 
@@ -1688,7 +1734,11 @@ class _FaceOverlayPainter extends CustomPainter {
   bool shouldRepaint(covariant _FaceOverlayPainter oldDelegate) {
     return oldDelegate.faces != faces ||
         oldDelegate.isSpeaking != isSpeaking ||
-        oldDelegate.mouthOpenProb != mouthOpenProb;
+        oldDelegate.mouthOpenProb != mouthOpenProb ||
+        // ต้องเทียบสองค่านี้ด้วย ไม่งั้นวงแสงจะไม่ขยับเลยแม้ตัวควบคุม
+        // แอนิเมชันจะวิ่งอยู่ก็ตาม เพราะ CustomPainter ไม่ repaint เอง
+        oldDelegate.pulseValue != pulseValue ||
+        oldDelegate.waveValue != waveValue;
   }
 }
 
