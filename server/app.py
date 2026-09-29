@@ -9,6 +9,7 @@ import io
 import csv
 import base64
 import time
+import logging
 from datetime import datetime
 import numpy as np
 import cv2
@@ -18,6 +19,23 @@ import torch
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+
+class _HealthCheckLogFilter(logging.Filter):
+    """กรอง log การเรียก /health และ /word_model_info ออกจาก console
+
+    แอป Flutter ยิงสอง endpoint นี้เองทุก 20 วินาทีตลอดเวลาที่เปิดหน้าสแกน
+    (เช็กว่า server ยังพร้อมมั้ย + ดึงค่า preprocessing ปัจจุบัน) ไม่ใช่ error
+    และไม่ได้บอกอะไรที่มีประโยชน์ต่อการ debug แต่ถ้าไม่กรองออก console จะเต็ม
+    ไปด้วยบรรทัดพวกนี้จนหา log ของ /predict_word ที่สำคัญกว่าไม่เจอ
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "/health" not in msg and "/word_model_info" not in msg
+
+
+logging.getLogger("uvicorn.access").addFilter(_HealthCheckLogFilter())
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
