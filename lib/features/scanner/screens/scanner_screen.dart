@@ -367,11 +367,15 @@ class _ScannerScreenState extends State<ScannerScreen>
       }
 
       // 🟢 เก็บข้อมูลใบหน้าสำหรับวาด Overlay (ไม่ setState — ดู _overlayData)
+      // ประทับเวลาไว้ทุกครั้งที่ตรวจจบหนึ่งรอบ ไม่ว่าจะเจอหน้าหรือไม่ก็ตาม —
+      // ใช้บอกทีหลังว่าข้อมูลชุดนี้ยังใหม่พอให้เชื่อมั้ย ถ้าการตรวจจับค้าง
+      // (เช่นตอนอีมูเลเตอร์กระตุก) จะได้ไม่โชว์ป้าย "เจอหน้าคุณแล้ว" ค้างเก่า
       final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation) ?? InputImageRotation.rotation0deg;
       _overlayData.value = _overlayData.value.copyWith(
         faces: faces,
         imageSize: Size(image.width.toDouble(), image.height.toDouble()),
         rotation: rotation,
+        detectedAt: DateTime.now(),
       );
 
       if (faces.isEmpty) {
@@ -1300,6 +1304,8 @@ class _ScannerScreenState extends State<ScannerScreen>
                       mouthOpenProb: data.mouthOpenProb,
                       pulseValue: _pulseCtrl.value,
                       waveValue: _waveCtrl.value,
+                      detectedAt: data.detectedAt,
+                      now: DateTime.now(),
                     ),
                   );
                 },
@@ -1472,6 +1478,9 @@ class _FaceOverlayData {
   final bool faceDetected;
   final bool isSpeaking;
   final double mouthOpenProb;
+  // เวลาที่ ML Kit ตรวจจับเสร็จรอบล่าสุด (ไม่ว่าจะเจอหน้าหรือไม่ก็ตาม) —
+  // painter ใช้ค่านี้เทียบกับเวลาปัจจุบันเพื่อรู้ว่าข้อมูลชุดนี้ค้างมานานแค่ไหน
+  final DateTime? detectedAt;
 
   const _FaceOverlayData({
     this.faces = const [],
@@ -1480,6 +1489,7 @@ class _FaceOverlayData {
     this.faceDetected = false,
     this.isSpeaking = false,
     this.mouthOpenProb = 0.0,
+    this.detectedAt,
   });
 
   _FaceOverlayData copyWith({
@@ -1489,6 +1499,7 @@ class _FaceOverlayData {
     bool? faceDetected,
     bool? isSpeaking,
     double? mouthOpenProb,
+    DateTime? detectedAt,
   }) {
     return _FaceOverlayData(
       faces: faces ?? this.faces,
@@ -1497,6 +1508,7 @@ class _FaceOverlayData {
       faceDetected: faceDetected ?? this.faceDetected,
       isSpeaking: isSpeaking ?? this.isSpeaking,
       mouthOpenProb: mouthOpenProb ?? this.mouthOpenProb,
+      detectedAt: detectedAt ?? this.detectedAt,
     );
   }
 }
@@ -1514,6 +1526,17 @@ class _FaceOverlayPainter extends CustomPainter {
   // ใช้วาดวงแสงหายใจตอนเจอหน้าเฉยๆ กับระลอกคลื่นตอนกำลังพูด
   final double pulseValue;
   final double waveValue;
+  // เวลาที่ตรวจจับเสร็จรอบล่าสุด กับเวลาปัจจุบัน (คำนวณตอนสั่งวาดแต่ละครั้ง)
+  // ใช้เทียบกันว่าข้อมูล faces ชุดนี้ค้างมานานแค่ไหนแล้ว
+  final DateTime? detectedAt;
+  final DateTime now;
+
+  // ข้อมูลเก่ากว่านี้ถือว่าเชื่อไม่ได้แล้ว เพราะระหว่างนั้น ML Kit อาจค้าง
+  // (เช่นตอนอีมูเลเตอร์กระตุก — เจอมาแล้วว่าค้างได้นานเป็นสิบวินาที) แสดง
+  // ป้าย/วงแสงจากข้อมูลเก่าขนาดนั้นต่อไปจะโกหกผู้ใช้ว่า "เจอหน้าแล้ว" ทั้งที่
+  // อาจไม่มีหน้าอยู่ตรงนั้นแล้วก็ได้ ใช้ค่าเดียวกับ _mouthRoiMaxAge ในหน้าจอ
+  // เพื่อให้ทั้งแอปมีความหมายเดียวกันว่า "ข้อมูลจากการตรวจจับเก่าแค่ไหนถึงเชื่อไม่ได้"
+  static const _maxAge = Duration(milliseconds: 1500);
 
   _FaceOverlayPainter({
     required this.faces,
@@ -1526,11 +1549,16 @@ class _FaceOverlayPainter extends CustomPainter {
     required this.mouthOpenProb,
     required this.pulseValue,
     required this.waveValue,
+    required this.detectedAt,
+    required this.now,
   });
+
+  bool get _isStale =>
+      detectedAt == null || now.difference(detectedAt!) > _maxAge;
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (faces.isEmpty) {
+    if (faces.isEmpty || _isStale) {
       _drawIdleFrame(canvas, size);
       return;
     }
@@ -1609,6 +1637,12 @@ class _FaceOverlayPainter extends CustomPainter {
 
   /// จุดกึ่งกลางริมฝีปาก เฉลี่ยจากจุด contour ทั้งสี่เส้น ใช้เป็นจุดยึดวาด
   /// วงแสง/ระลอกคลื่น คืน null เมื่อหาไม่ได้ ซึ่งแปลว่าไม่ควรวาดเดามั่ว
+  ///
+  /// ⚠️ ต้องหาจุดกึ่งกลางของแต่ละเส้นก่อน แล้วค่อยเฉลี่ยรวม 4 เส้นนั้นอีกที
+  /// ห้ามเอาจุดทั้งหมดจากทุกเส้นมากองรวมกันแล้วหารด้วยจำนวนจุดทั้งหมด เพราะ
+  /// เส้นรอบนอก (upperLipTop, lowerLipBottom) มีจำนวนจุดมากกว่าเส้นด้านใน
+  /// (upperLipBottom, lowerLipTop) — ทำแบบเดิมแล้วค่าเฉลี่ยจะเอนไปทางเส้นที่
+  /// มีจุดเยอะกว่าโดยไม่ตั้งใจ วงแสงจึงไม่ได้อยู่กึ่งกลางปากจริงๆ
   Offset? _mouthCenter(Face face, Size size) {
     const types = [
       FaceContourType.upperLipTop,
@@ -1616,20 +1650,24 @@ class _FaceOverlayPainter extends CustomPainter {
       FaceContourType.lowerLipTop,
       FaceContourType.lowerLipBottom,
     ];
-    double sumX = 0, sumY = 0;
-    int count = 0;
+    final lineCenters = <Offset>[];
     for (final type in types) {
       final points = face.contours[type]?.points;
-      if (points == null) continue;
+      if (points == null || points.isEmpty) continue;
+      double sumX = 0, sumY = 0;
       for (final p in points) {
         final s = _scalePoint(p, size);
         sumX += s.dx;
         sumY += s.dy;
-        count++;
       }
+      lineCenters.add(Offset(sumX / points.length, sumY / points.length));
     }
-    if (count == 0) return null;
-    return Offset(sumX / count, sumY / count);
+    if (lineCenters.isEmpty) return null;
+    final avgX =
+        lineCenters.map((o) => o.dx).reduce((a, b) => a + b) / lineCenters.length;
+    final avgY =
+        lineCenters.map((o) => o.dy).reduce((a, b) => a + b) / lineCenters.length;
+    return Offset(avgX, avgY);
   }
 
   void _drawMouthFocus(Canvas canvas, Size size, Face face) {
