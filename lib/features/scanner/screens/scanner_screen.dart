@@ -51,6 +51,12 @@ class _ScannerScreenState extends State<ScannerScreen>
         ),
       );
   bool _isProcessingFrame = false;
+  // เวลาที่ callback ของสตรีมกล้องถูกเรียกครั้งล่าสุด — ดู _cameraWatchdog
+  DateTime? _lastFrameAt;
+  Timer? _cameraWatchdogTimer;
+  // กำลังสั่ง restart สตรีมกล้องอยู่มั้ย กันไม่ให้ watchdog สั่งซ้อนกันหลายรอบ
+  // ถ้ารอบก่อนหน้ายังไม่เสร็จ
+  bool _restartingCamera = false;
 
   // ─── Face Overlay ─────────────────────────────────────────────────────────
   // ข้อมูลชุดนี้เปลี่ยนทุกเฟรมกล้อง แต่มีแค่ overlay ที่ใช้ จึงเก็บไว้ใน
@@ -270,6 +276,10 @@ class _ScannerScreenState extends State<ScannerScreen>
     _overlayTickTimer = Timer.periodic(const Duration(milliseconds: 80), (_) {
       _overlayTick.value++;
     });
+    _cameraWatchdogTimer = Timer.periodic(
+      const Duration(seconds: 3),
+      (_) => _checkCameraWatchdog(),
+    );
     _initCamera();
     _checkApiStatus();
     _apiStatusTimer = Timer.periodic(
@@ -367,7 +377,52 @@ class _ScannerScreenState extends State<ScannerScreen>
     await _startCamera(nextIndex);
   }
 
+  /// เช็กทุก 3 วินาทีว่ากล้องยังส่งเฟรมมาให้ _onCameraFrame อยู่จริงมั้ย
+  ///
+  /// เจอมาแล้วว่ากล้องหยุดส่งเฟรมให้ ImageAnalysis เงียบๆ ได้จริง (พิสูจน์จาก
+  /// binder transaction ไปยัง IGraphicBufferProducer ที่ใช้เวลาเกิน 1 วินาที
+  /// ต่อครั้งช่วงหนึ่ง แล้วหลังจากนั้น _onCameraFrame ไม่ถูกเรียกอีกเลยนานเป็น
+  /// สิบนาที) โดยที่ preview ในจอยังเห็นภาพเคลื่อนไหวปกติ เพราะเป็นคนละ
+  /// pipeline กับที่ใช้วิเคราะห์ ไม่มี exception ให้จับ ไม่มีทางรู้เลยว่าตายไป
+  /// แล้วถ้าไม่เช็กแบบนี้ — ต่างจาก ML Kit ค้าง (ซึ่งแก้แล้วด้วย timeout ใน
+  /// _onCameraFrame) เพราะกรณีนี้ callback หยุดถูกเรียกไปเลย ไม่ใช่แค่ค้างอยู่
+  /// ข้างในครั้งเดียว
+  void _checkCameraWatchdog() {
+    if (!mounted || _restartingCamera) return;
+    final last = _lastFrameAt;
+    if (last == null) return; // ยังไม่เคยได้เฟรมเลย ปล่อยให้ตอนเปิดกล้องจัดการ
+    if (DateTime.now().difference(last) > const Duration(seconds: 4)) {
+      _restartCameraStream();
+    }
+  }
+
+  Future<void> _restartCameraStream() async {
+    if (_restartingCamera) return;
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) return;
+
+    _restartingCamera = true;
+    debugPrint('⚠️ ไม่มีเฟรมกล้องเข้ามาเกิน 4 วินาที กำลังรีสตาร์ทสตรีมกล้อง');
+    try {
+      if (controller.value.isStreamingImages) {
+        await controller.stopImageStream();
+      }
+      await controller.startImageStream(_onCameraFrame);
+      // ให้เวลาหายใจก่อนเช็กรอบถัดไป ไม่ให้ถือว่ายังค้างทั้งที่เพิ่งสั่งใหม่ไป
+      _lastFrameAt = DateTime.now();
+    } catch (e) {
+      debugPrint('รีสตาร์ทสตรีมกล้องไม่สำเร็จ: $e');
+    } finally {
+      _restartingCamera = false;
+    }
+  }
+
   Future<void> _onCameraFrame(CameraImage image) async {
+    // ประทับเวลาไว้ทุกครั้งที่ callback นี้ถูกเรียก ไม่ว่าจะทำอะไรต่อหรือไม่
+    // ก็ตาม — ใช้เป็นสัญญาณชีพให้ _cameraWatchdog เช็กว่ากล้องยังส่งเฟรมมาอยู่
+    // จริงมั้ย (ดูเหตุผลเต็มๆ ที่ _cameraWatchdog)
+    _lastFrameAt = DateTime.now();
+
     final camera = _cameras[_isFrontCamera ? 1 : 0];
 
     // ─── เส้นทางเร็ว: เก็บภาพปากทุกเฟรมกล้อง ไม่ต้องรอ ML Kit ───────────────
@@ -1228,6 +1283,7 @@ class _ScannerScreenState extends State<ScannerScreen>
     _pulseCtrl.dispose();
     _waveCtrl.dispose();
     _overlayTickTimer?.cancel();
+    _cameraWatchdogTimer?.cancel();
     _overlayTick.dispose();
     // ปล่อยกล้องโดยรอให้หยุดสตรีมก่อนจริงๆ ของเดิมเรียก dispose() ทับทันทีทั้งที่
     // stopImageStream() ยังไม่จบ เฟรมที่ค้างอยู่จึงถูกส่งมาหลัง engine ถอดตัวไป
