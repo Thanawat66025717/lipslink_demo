@@ -33,17 +33,23 @@ class _ScannerScreenState extends State<ScannerScreen>
   bool _isFrontCamera = true;
 
   // ─── ML Kit ───────────────────────────────────────────────────────────────
-  final FaceDetector _faceDetector = FaceDetector(
-    options: FaceDetectorOptions(
-      enableClassification: true,
-      enableLandmarks: true,
-      // ต้องเปิดไว้ เพราะ _estimateMouthOpen วัดช่องว่างริมฝีปากจากจุด contour
-      // ถ้าปิดจะตรวจไม่เจอว่าอ้าปาก แล้วระบบจะไม่เริ่มบันทึกเลย แลกกับที่มันกิน
-      // เวลาราวครึ่งหนึ่งของงานต่อเฟรมทั้งหมด
-      enableContours: true,
-      performanceMode: FaceDetectorMode.fast,
-    ),
-  );
+  // ไม่ใช่ final แล้ว เพราะต้องสร้างตัวใหม่ทดแทนได้ถ้าตัวเดิมค้าง (ดู
+  // _rebuildFaceDetector) — เจอมาแล้วว่า native call ของตัวตรวจจับค้างได้
+  // จริง แล้วเรียกซ้ำบนตัวเดิมที่ยังค้างอยู่เสี่ยงพังกว่าเดิม จึงปิดตัวเก่าทิ้ง
+  // แล้วสร้างใหม่แทนที่จะพยายามเรียกตัวเดิมต่อ
+  FaceDetector _faceDetector = _newFaceDetector();
+
+  static FaceDetector _newFaceDetector() => FaceDetector(
+        options: FaceDetectorOptions(
+          enableClassification: true,
+          enableLandmarks: true,
+          // ต้องเปิดไว้ เพราะ _estimateMouthOpen วัดช่องว่างริมฝีปากจากจุด
+          // contour ถ้าปิดจะตรวจไม่เจอว่าอ้าปาก แล้วระบบจะไม่เริ่มบันทึกเลย
+          // แลกกับที่มันกินเวลาราวครึ่งหนึ่งของงานต่อเฟรมทั้งหมด
+          enableContours: true,
+          performanceMode: FaceDetectorMode.fast,
+        ),
+      );
   bool _isProcessingFrame = false;
 
   // ─── Face Overlay ─────────────────────────────────────────────────────────
@@ -400,7 +406,26 @@ class _ScannerScreenState extends State<ScannerScreen>
         return;
       }
 
-      final faces = await _faceDetector.processImage(inputImage);
+      // ใส่ timeout ไว้กันไม่ให้ตรวจจับตายถาวร — ถ้า native call ของ ML Kit
+      // ค้างแม้แต่ครั้งเดียว (เจอมาแล้วจริงว่าเกิดได้ ทั้งเซสชันไม่มี log
+      // ตรวจจับสำเร็จเลยสักครั้ง) โค้ดเดิมจะไม่มีวันไปถึง _isProcessingFrame
+      // = false อีกเลย เพราะรอ await อยู่ตรงนี้ตลอดไป ทุกเฟรมหลังจากนั้นจะ
+      // โดน `if (_isProcessingFrame) return;` เงียบๆ ไปตลอดชีวิตแอป โดยไม่มี
+      // error ให้เห็นเลยด้วยซ้ำ ต้องปิดเปิดแอปใหม่เท่านั้นถึงจะกลับมาใช้ได้
+      //
+      // เมื่อ timeout ต้องปิดตัวตรวจจับเดิมแล้วสร้างใหม่ด้วย ไม่ใช่แค่ข้าม
+      // เฟรมไปเฉยๆ เพราะ native call ที่ค้างอยู่อาจยังไม่จบจริง การเรียก
+      // processImage() ซ้ำบนตัวเดิมที่ยังมีงานค้างอยู่ข้างในเสี่ยงพังยิ่งกว่า
+      // เดิม ปิดของเก่าทิ้งตัดปัญหาให้เด็ดขาดดีกว่า
+      final faces = await _faceDetector
+          .processImage(inputImage)
+          .timeout(const Duration(seconds: 2), onTimeout: () {
+        debugPrint('⚠️ ML Kit ค้างเกิน 2 วินาที กำลังสร้างตัวตรวจจับใหม่');
+        final old = _faceDetector;
+        _faceDetector = _newFaceDetector();
+        old.close();
+        return <Face>[];
+      });
       if (!mounted) {
         _isProcessingFrame = false;
         return;
