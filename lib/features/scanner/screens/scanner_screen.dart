@@ -209,6 +209,40 @@ class _ScannerScreenState extends State<ScannerScreen>
   late AnimationController _pulseCtrl;
   late AnimationController _waveCtrl;
 
+  // ป้ายสถานะมีข้อความคงที่แค่สองแบบ สร้าง+จัดเลย์เอาต์ครั้งเดียวตอนเปิดจอ
+  // แล้วส่งต่อให้ painter ใช้ซ้ำทุกเฟรม ไม่ใช่สร้าง TextPainter ใหม่แล้ว
+  // layout() ใหม่ทุกครั้งที่ paint() ทำงาน (ซึ่งตอนนี้ทำงานที่ 60 fps ตามรอบ
+  // แอนิเมชันวงแสง — layout() ข้อความรัว 60 ครั้ง/วินาทีคือของแพงที่ไม่จำเป็น)
+  late final TextPainter _foundLabelPainter = _buildStatusLabel('เจอหน้าคุณแล้ว');
+  late final TextPainter _listeningLabelPainter =
+      _buildStatusLabel('กำลังฟังอยู่...');
+
+  // เดิมใช้ AnimatedBuilder ฟัง _pulseCtrl/_waveCtrl ตรงๆ ซึ่งวิ่งที่ 60 fps
+  // ตาม vsync ของจอ ปัญหาคือมันบังคับให้ทั้งต้นไม้ widget (ValueListenableBuilder
+  // + CustomPaint + _FaceOverlayPainter object ใหม่) ถูกสร้างใหม่ 60 ครั้ง/
+  // วินาที ไม่ว่าข้างในจะเบาแค่ไหนก็ตาม — วัดแล้วทำให้ GC ทำงานถี่เกือบ 3
+  // ครั้ง/วินาทีตลอดเวลา แม้ไม่ได้ทำอะไรเลย (แก้แค่เนื้อหาข้างใน paint() ให้
+  // เบาลงไม่ช่วยเลย เพราะปัญหาไม่ได้อยู่ตรงนั้น) จึงลดอัตรามาใช้ Timer ที่นี่
+  // แทน ยังคงอ่านค่าจาก _pulseCtrl/_waveCtrl ได้ตามปกติ (มันคำนวณค่าต่อเนื่อง
+  // อยู่แล้วไม่ว่าจะมีใครอ่านบ่อยแค่ไหน) แค่ลดความถี่ที่จะสร้าง widget ใหม่
+  // เหลือ ~12 ครั้ง/วินาที ซึ่งยังลื่นพอสำหรับแอนิเมชันจังหวะช้าแบบนี้
+  final ValueNotifier<int> _overlayTick = ValueNotifier(0);
+  Timer? _overlayTickTimer;
+
+  static TextPainter _buildStatusLabel(String text) {
+    return TextPainter(
+      text: TextSpan(
+        text: text,
+        style: const TextStyle(
+          color: AppTheme.textPrimary,
+          fontSize: 12,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+  }
+
   // ─── User ─────────────────────────────────────────────────────────────────
   final _uuid = const Uuid();
 
@@ -224,6 +258,12 @@ class _ScannerScreenState extends State<ScannerScreen>
       vsync: this,
       duration: const Duration(milliseconds: 1500),
     )..repeat();
+    // ดูเหตุผลที่ _overlayTick — จำกัดอัตราสร้าง widget overlay ใหม่ไว้ที่
+    // ~12 ครั้ง/วินาที แทนที่จะปล่อยให้วิ่งตาม vsync 60 fps ของ _pulseCtrl/
+    // _waveCtrl ตรงๆ
+    _overlayTickTimer = Timer.periodic(const Duration(milliseconds: 80), (_) {
+      _overlayTick.value++;
+    });
     _initCamera();
     _checkApiStatus();
     _apiStatusTimer = Timer.periodic(
@@ -380,6 +420,7 @@ class _ScannerScreenState extends State<ScannerScreen>
 
       if (faces.isEmpty) {
         _updateMouthState(0.0, faceDetected: false);
+        _overlayData.value = _overlayData.value.copyWithMouthCenter(null);
       } else {
         final face = faces.first;
         final prob = face.smilingProbability ?? 0.0;
@@ -392,6 +433,12 @@ class _ScannerScreenState extends State<ScannerScreen>
           _lastMouthRoi = roi;
           _lastMouthRoiAt = DateTime.now();
         }
+
+        // คำนวณจุดกึ่งกลางปาก "ตอนนี้เลย" — ครั้งเดียวต่อการตรวจจับหนึ่งรอบ
+        // (ราวไม่กี่ครั้ง/วินาที) แทนที่จะให้ painter คำนวณใหม่ทุกเฟรมแอนิเมชัน
+        // ของวงแสง (60 ครั้ง/วินาที) ดูเหตุผลเต็มๆ ที่ _mouthCenterRaw
+        _overlayData.value =
+            _overlayData.value.copyWithMouthCenter(_mouthCenterRaw(face));
       }
     } catch (e) {
       debugPrint('ML Kit error: $e');
@@ -450,6 +497,45 @@ class _ScannerScreenState extends State<ScannerScreen>
     if (_collectedLipFrames.length < _modelFrameCount) return false;
     final elapsed = _captureMs;
     return elapsed != null && elapsed >= _targetCaptureMs;
+  }
+
+  /// จุดกึ่งกลางริมฝีปาก ในพิกัดดิบของ ML Kit (ยังไม่ scale ไปที่ผืนวาด) —
+  /// เฉลี่ยแบบให้เส้น contour ทั้งสี่เส้นมีน้ำหนักเท่ากัน (หาจุดกึ่งกลางของ
+  /// แต่ละเส้นก่อน แล้วค่อยเฉลี่ยรวม 4 จุดนั้นอีกที) ไม่งั้นเส้นที่มีจำนวนจุด
+  /// เยอะกว่า (เส้นรอบนอก) จะดึงผลลัพธ์เอนไปทางตัวเองโดยไม่ตั้งใจ
+  ///
+  /// ⚠️ ต้องเรียกจากจุดที่ตรวจจับเสร็จเท่านั้น (ราวไม่กี่ครั้ง/วินาที) ห้ามเรียก
+  /// จาก paint() ของ _FaceOverlayPainter ซึ่งวิ่งที่ 60 fps ตามรอบแอนิเมชัน
+  /// ของวงแสง — เคยพลาดมาแล้ว: การไล่จุด contour ทั้งหมดใหม่ทุกเฟรมแอนิเมชัน
+  /// ทำให้ GC ทำงานถี่ขึ้นเป็นเกือบ 2 ครั้ง/วินาทีตลอดเวลา แม้ตอนแอปไม่ได้
+  /// ทำอะไรเลย จนแย่งเวลา CPU ที่ ML Kit/กล้องต้องใช้ กลายเป็นสาเหตุที่ทำให้
+  /// ตรวจจับหน้าดูค้าง/ช้าลงจริง ไม่ใช่แค่ปัญหาของอีมูเลเตอร์อย่างที่คิดตอนแรก
+  Offset? _mouthCenterRaw(Face face) {
+    const types = [
+      FaceContourType.upperLipTop,
+      FaceContourType.upperLipBottom,
+      FaceContourType.lowerLipTop,
+      FaceContourType.lowerLipBottom,
+    ];
+    final lineCenters = <Offset>[];
+    for (final type in types) {
+      final points = face.contours[type]?.points;
+      if (points == null || points.isEmpty) continue;
+      double sumX = 0, sumY = 0;
+      for (final p in points) {
+        sumX += p.x;
+        sumY += p.y;
+      }
+      lineCenters.add(Offset(sumX / points.length, sumY / points.length));
+    }
+    if (lineCenters.isEmpty) return null;
+
+    double avgX = 0, avgY = 0;
+    for (final c in lineCenters) {
+      avgX += c.dx;
+      avgY += c.dy;
+    }
+    return Offset(avgX / lineCenters.length, avgY / lineCenters.length);
   }
 
   /// กรอบจัตุรัสรอบปาก ในระบบพิกัดเดียวกับที่ ML Kit คืนค่ามา
@@ -1116,6 +1202,8 @@ class _ScannerScreenState extends State<ScannerScreen>
     _overlayData.dispose();
     _pulseCtrl.dispose();
     _waveCtrl.dispose();
+    _overlayTickTimer?.cancel();
+    _overlayTick.dispose();
     // ปล่อยกล้องโดยรอให้หยุดสตรีมก่อนจริงๆ ของเดิมเรียก dispose() ทับทันทีทั้งที่
     // stopImageStream() ยังไม่จบ เฟรมที่ค้างอยู่จึงถูกส่งมาหลัง engine ถอดตัวไป
     // แล้ว ทำให้แอป crash ตอนปิด (FlutterJNI is not attached to native)
@@ -1276,16 +1364,16 @@ class _ScannerScreenState extends State<ScannerScreen>
     // ทั้งหน้าจอทุกเฟรมกล้อง ข้อมูลชุดนี้มีแค่ overlay ที่ใช้ จึงไม่มีเหตุผล
     // ให้ทั้งจอวาดใหม่ตามไปด้วยในอัตราเดียวกับกล้อง
     //
-    // ครอบด้วย AnimatedBuilder ฟัง _pulseCtrl/_waveCtrl เพิ่ม — สองตัวนี้ถูก
-    // สร้างและวิ่งอยู่แล้วตั้งแต่ initState() แต่ไม่เคยมีใครอ่านค่ามันเลย จึงไม่มี
-    // อะไรในจอเคลื่อนไหวเลยสักจุด ตอนนี้ค่าปัจจุบันถูกส่งเข้าไปให้ painter วาด
-    // เป็นวงแสงหายใจ/ระลอกคลื่นรอบปาก
+    // ครอบด้วย _overlayTick เพิ่ม (ดูเหตุผลตรงจุดประกาศตัวแปร) เพื่อให้วงแสง
+    // หายใจ/ระลอกคลื่นรอบปากขยับได้ — อ่านค่าจาก _pulseCtrl/_waveCtrl ซึ่งวิ่ง
+    // อยู่แล้วตั้งแต่ initState() แต่จำกัดอัตราสร้าง widget ใหม่ไว้ที่ timer
+    // แทนที่จะผูกกับ vsync 60 fps ของ AnimationController ตรงๆ
     return RepaintBoundary(
       child: LayoutBuilder(
         builder: (context, constraints) {
-          return AnimatedBuilder(
-            animation: Listenable.merge([_pulseCtrl, _waveCtrl]),
-            builder: (context, _) {
+          return ValueListenableBuilder<int>(
+            valueListenable: _overlayTick,
+            builder: (context, _, __) {
               return ValueListenableBuilder<_FaceOverlayData>(
                 valueListenable: _overlayData,
                 builder: (context, data, _) {
@@ -1306,6 +1394,9 @@ class _ScannerScreenState extends State<ScannerScreen>
                       waveValue: _waveCtrl.value,
                       detectedAt: data.detectedAt,
                       now: DateTime.now(),
+                      mouthCenterRaw: data.mouthCenterRaw,
+                      foundLabelPainter: _foundLabelPainter,
+                      listeningLabelPainter: _listeningLabelPainter,
                     ),
                   );
                 },
@@ -1481,6 +1572,9 @@ class _FaceOverlayData {
   // เวลาที่ ML Kit ตรวจจับเสร็จรอบล่าสุด (ไม่ว่าจะเจอหน้าหรือไม่ก็ตาม) —
   // painter ใช้ค่านี้เทียบกับเวลาปัจจุบันเพื่อรู้ว่าข้อมูลชุดนี้ค้างมานานแค่ไหน
   final DateTime? detectedAt;
+  // จุดกึ่งกลางปาก คำนวณไว้แล้วครั้งเดียวตอนตรวจจับเสร็จ (ดู _mouthCenterRaw)
+  // painter แค่เอาไป scale ลงผืนวาด ไม่ต้องไล่จุด contour ใหม่ทุกเฟรม
+  final Offset? mouthCenterRaw;
 
   const _FaceOverlayData({
     this.faces = const [],
@@ -1490,6 +1584,7 @@ class _FaceOverlayData {
     this.isSpeaking = false,
     this.mouthOpenProb = 0.0,
     this.detectedAt,
+    this.mouthCenterRaw,
   });
 
   _FaceOverlayData copyWith({
@@ -1509,6 +1604,23 @@ class _FaceOverlayData {
       isSpeaking: isSpeaking ?? this.isSpeaking,
       mouthOpenProb: mouthOpenProb ?? this.mouthOpenProb,
       detectedAt: detectedAt ?? this.detectedAt,
+      mouthCenterRaw: mouthCenterRaw, // ดู copyWithMouthCenter ด้านล่าง
+    );
+  }
+
+  /// แยกออกมาต่างหากจาก copyWith ปกติ เพราะ "ไม่มีหน้าแล้ว" ต้องเคลียร์ค่านี้
+  /// กลับเป็น null ได้จริง — ถ้าใช้ pattern `param ?? this.field` แบบ copyWith
+  /// ทั่วไป จะไม่มีทางส่ง null เข้าไปทับค่าเก่าได้เลย (เพราะ null ?? old = old)
+  _FaceOverlayData copyWithMouthCenter(Offset? center) {
+    return _FaceOverlayData(
+      faces: faces,
+      imageSize: imageSize,
+      rotation: rotation,
+      faceDetected: faceDetected,
+      isSpeaking: isSpeaking,
+      mouthOpenProb: mouthOpenProb,
+      detectedAt: detectedAt,
+      mouthCenterRaw: center,
     );
   }
 }
@@ -1530,6 +1642,13 @@ class _FaceOverlayPainter extends CustomPainter {
   // ใช้เทียบกันว่าข้อมูล faces ชุดนี้ค้างมานานแค่ไหนแล้ว
   final DateTime? detectedAt;
   final DateTime now;
+  // จุดกึ่งกลางปาก คำนวณไว้แล้วจากภายนอก (ดู _mouthCenterRaw) ที่นี่แค่ scale
+  // ลงผืนวาด ไม่ไล่จุด contour ใหม่ — จุดนี้คือหัวใจของการแก้ปัญหา GC ถี่
+  final Offset? mouthCenterRaw;
+  // ป้ายสถานะสร้าง+ layout() มาแล้วครั้งเดียวจากภายนอก (ดู _buildStatusLabel)
+  // painter แค่ paint() ซ้ำทุกเฟรม ไม่ต้องสร้าง TextPainter ใหม่ทุกครั้ง
+  final TextPainter foundLabelPainter;
+  final TextPainter listeningLabelPainter;
 
   // ข้อมูลเก่ากว่านี้ถือว่าเชื่อไม่ได้แล้ว เพราะระหว่างนั้น ML Kit อาจค้าง
   // (เช่นตอนอีมูเลเตอร์กระตุก — เจอมาแล้วว่าค้างได้นานเป็นสิบวินาที) แสดง
@@ -1551,6 +1670,9 @@ class _FaceOverlayPainter extends CustomPainter {
     required this.waveValue,
     required this.detectedAt,
     required this.now,
+    required this.mouthCenterRaw,
+    required this.foundLabelPainter,
+    required this.listeningLabelPainter,
   });
 
   bool get _isStale =>
@@ -1564,9 +1686,8 @@ class _FaceOverlayPainter extends CustomPainter {
     }
 
     _logGeometryOnce(size);
-    for (final face in faces) {
-      _drawFaceTracking(canvas, size, face);
-    }
+    _drawStatusChip(canvas);
+    _drawMouthFocus(canvas, size);
   }
 
   void _drawIdleFrame(Canvas canvas, Size size) {
@@ -1589,26 +1710,12 @@ class _FaceOverlayPainter extends CustomPainter {
   /// พร้อมเส้นตาข่ายพาดทับทั้งหน้า (คิ้ว-ตา-จมูก-ปาก) ซึ่งดูเหมือนถูกเครื่อง
   /// สแกนมากกว่าแอปสื่อสารที่ควรรู้สึกอบอุ่น — เปลี่ยนเป็นชิปสถานะโทนขาวนวล
   /// บวกวงแสงเฉพาะรอบปาก (จุดที่ผู้ใช้ต้องโฟกัสจริงๆ) แทน
-  void _drawFaceTracking(Canvas canvas, Size size, Face face) {
-    _drawStatusChip(canvas);
-    _drawMouthFocus(canvas, size, face);
-  }
-
   void _drawStatusChip(Canvas canvas) {
-    final label = isSpeaking ? 'กำลังฟังอยู่...' : 'เจอหน้าคุณแล้ว';
+    // สร้างมาจากภายนอกครั้งเดียวแล้ว (ดู _buildStatusLabel) ที่นี่แค่เลือกใช้
+    // ไม่ layout() ใหม่ — เคยสร้าง+layout() ใหม่ตรงนี้ทุกครั้งที่ paint() ทำงาน
+    // ซึ่งตอนนี้เกิดที่ 60 fps ตามรอบแอนิเมชันวงแสง ทำให้ GC ทำงานถี่ผิดปกติ
+    final textPainter = isSpeaking ? listeningLabelPainter : foundLabelPainter;
     final dotColor = isSpeaking ? AppTheme.successDark : AppTheme.success;
-
-    final textPainter = TextPainter(
-      text: TextSpan(
-        text: label,
-        style: const TextStyle(
-          color: AppTheme.textPrimary,
-          fontSize: 12,
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout();
 
     const dotRadius = 4.0;
     const paddingH = 12.0;
@@ -1635,44 +1742,32 @@ class _FaceOverlayPainter extends CustomPainter {
     );
   }
 
-  /// จุดกึ่งกลางริมฝีปาก เฉลี่ยจากจุด contour ทั้งสี่เส้น ใช้เป็นจุดยึดวาด
-  /// วงแสง/ระลอกคลื่น คืน null เมื่อหาไม่ได้ ซึ่งแปลว่าไม่ควรวาดเดามั่ว
-  ///
-  /// ⚠️ ต้องหาจุดกึ่งกลางของแต่ละเส้นก่อน แล้วค่อยเฉลี่ยรวม 4 เส้นนั้นอีกที
-  /// ห้ามเอาจุดทั้งหมดจากทุกเส้นมากองรวมกันแล้วหารด้วยจำนวนจุดทั้งหมด เพราะ
-  /// เส้นรอบนอก (upperLipTop, lowerLipBottom) มีจำนวนจุดมากกว่าเส้นด้านใน
-  /// (upperLipBottom, lowerLipTop) — ทำแบบเดิมแล้วค่าเฉลี่ยจะเอนไปทางเส้นที่
-  /// มีจุดเยอะกว่าโดยไม่ตั้งใจ วงแสงจึงไม่ได้อยู่กึ่งกลางปากจริงๆ
-  Offset? _mouthCenter(Face face, Size size) {
-    const types = [
-      FaceContourType.upperLipTop,
-      FaceContourType.upperLipBottom,
-      FaceContourType.lowerLipTop,
-      FaceContourType.lowerLipBottom,
-    ];
-    final lineCenters = <Offset>[];
-    for (final type in types) {
-      final points = face.contours[type]?.points;
-      if (points == null || points.isEmpty) continue;
-      double sumX = 0, sumY = 0;
-      for (final p in points) {
-        final s = _scalePoint(p, size);
-        sumX += s.dx;
-        sumY += s.dy;
-      }
-      lineCenters.add(Offset(sumX / points.length, sumY / points.length));
+  /// แปลงจุดกึ่งกลางปาก (คำนวณไว้แล้วจากภายนอก ในพิกัดดิบของ ML Kit) ให้เป็น
+  /// พิกัดบนผืนวาด ให้ตรงกับที่ CameraPreview วาดจริง — สูตรเดียวกับที่ใช้แปลง
+  /// พิกัดครอปภาพปากตอนเก็บเฟรม ต่างกันแค่ที่นี่รับพิกัดดิบทีละจุดเดียว
+  /// (ไม่ใช่ไล่ทั้ง contour) เพราะจุดนั้นถูกเฉลี่ยไว้เรียบร้อยแล้วตั้งแต่ตอน
+  /// ตรวจจับเสร็จ ไม่ใช่ตอน paint()
+  Offset _toCanvasSpace(Offset raw, Size widgetSize) {
+    final double imageW, imageH;
+    if (rotation == InputImageRotation.rotation90deg ||
+        rotation == InputImageRotation.rotation270deg) {
+      imageW = imageSize.height;
+      imageH = imageSize.width;
+    } else {
+      imageW = imageSize.width;
+      imageH = imageSize.height;
     }
-    if (lineCenters.isEmpty) return null;
-    final avgX =
-        lineCenters.map((o) => o.dx).reduce((a, b) => a + b) / lineCenters.length;
-    final avgY =
-        lineCenters.map((o) => o.dy).reduce((a, b) => a + b) / lineCenters.length;
-    return Offset(avgX, avgY);
+
+    final scale = min(widgetSize.width / imageW, widgetSize.height / imageH);
+    final dx = (widgetSize.width - imageW * scale) / 2;
+    final dy = (widgetSize.height - imageH * scale) / 2;
+    return Offset(dx + raw.dx * scale, dy + raw.dy * scale);
   }
 
-  void _drawMouthFocus(Canvas canvas, Size size, Face face) {
-    final center = _mouthCenter(face, size);
-    if (center == null) return;
+  void _drawMouthFocus(Canvas canvas, Size size) {
+    final raw = mouthCenterRaw;
+    if (raw == null) return;
+    final center = _toCanvasSpace(raw, size);
 
     // ยิ่งปากอ้ากว้าง วงแสงยิ่งใหญ่ขึ้น — ผูกกับข้อมูลจริงแทนที่จะเป็นแค่ตกแต่ง
     final baseRadius = 22.0 + mouthOpenProb.clamp(0.0, 1.0) * 20.0;
@@ -1705,57 +1800,6 @@ class _FaceOverlayPainter extends CustomPainter {
     }
   }
 
-  Rect _scaleRect(Rect faceRect, Size widgetSize) {
-    double imageW, imageH;
-
-    if (rotation == InputImageRotation.rotation90deg ||
-        rotation == InputImageRotation.rotation270deg) {
-      imageW = imageSize.height;
-      imageH = imageSize.width;
-    } else {
-      imageW = imageSize.width;
-      imageH = imageSize.height;
-    }
-
-    final scaleX = widgetSize.width / imageW;
-    final scaleY = widgetSize.height / imageH;
-
-    // 🟢 ไม่ต้อง flip พิกัดเองแล้ว เพราะ widget แม่ (ScannerScreen) ครอบทั้ง
-    // CameraPreview กับ overlay นี้ไว้ใน Transform เดียวกันสำหรับกล้องหน้า
-    // ถ้า flip ซ้ำที่นี่อีกจะกลายเป็น flip 2 ต่อ จุดจะไปคนละตำแหน่งกับใบหน้า
-    final left = faceRect.left * scaleX;
-    final top = faceRect.top * scaleY;
-    final right = faceRect.right * scaleX;
-    final bottom = faceRect.bottom * scaleY;
-
-    return Rect.fromLTRB(left, top, right, bottom);
-  }
-
-  /// แปลงจุดจาก ML Kit มาเป็นพิกัดบนผืนวาด ให้ตรงกับที่ CameraPreview วาดจริง
-  ///
-  /// ของเดิมยืดพิกัดให้เต็มผืนวาดด้วยอัตราส่วนคนละค่าในแนวนอนกับแนวตั้ง แต่
-  /// CameraPreview รักษาสัดส่วนภาพไว้ (จึงมีแถบดำคั่น) ภาพจริงเลยกินพื้นที่แค่
-  /// ส่วนกลาง ผลคือจุดตรงพอดีเฉพาะตอนหน้าอยู่กลางจอ และเพี้ยนมากขึ้นเรื่อยๆ
-  /// เมื่อหน้าเลื่อนออกไปทางขอบ
-  Offset _scalePoint(Point<int> point, Size widgetSize) {
-    // ML Kit ให้พิกัดในภาพที่หมุนตั้งแล้ว ซึ่งเป็นภาพเดียวกับที่ preview แสดง
-    final double imageW, imageH;
-    if (rotation == InputImageRotation.rotation90deg ||
-        rotation == InputImageRotation.rotation270deg) {
-      imageW = imageSize.height;
-      imageH = imageSize.width;
-    } else {
-      imageW = imageSize.width;
-      imageH = imageSize.height;
-    }
-
-    // อัตราส่วนเดียวกันทั้งสองแกน แล้วเลื่อนให้อยู่กลางเหมือนที่ preview วาง
-    final scale = min(widgetSize.width / imageW, widgetSize.height / imageH);
-    final dx = (widgetSize.width - imageW * scale) / 2;
-    final dy = (widgetSize.height - imageH * scale) / 2;
-
-    return Offset(dx + point.x * scale, dy + point.y * scale);
-  }
 
   /// พิมพ์ขนาดจริงครั้งเดียว ไว้ตรวจว่าการแปลงพิกัดข้างบนตั้งสมมติฐานถูกมั้ย
   static bool _loggedGeometry = false;
