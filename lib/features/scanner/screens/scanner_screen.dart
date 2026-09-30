@@ -100,9 +100,18 @@ class _ScannerScreenState extends State<ScannerScreen>
   DateTime? _lastMouthRoiAt;
   // เก่ากว่านี้ถือว่าเชื่อไม่ได้แล้ว เพราะหน้าอาจเลื่อนไปไกลจนครอปผิดที่
   //
-  // ต้องยาวพอคลุมทั้งประโยค (ราว 1 วินาที) เพราะระหว่างเก็บเฟรมเราหยุดตรวจหน้า
-  // กรอบจึงไม่ถูกรีเฟรชเลยตลอดช่วงนั้น หัวคนขยับไม่กี่พิกเซลในเวลาเท่านี้
-  static const Duration _mouthRoiMaxAge = Duration(milliseconds: 1500);
+  // ต้องยาวพอคลุมทั้งประโยค เพราะระหว่างเก็บเฟรมเราหยุดตรวจหน้า (ดูเงื่อนไข
+  // ข้าม ML Kit ใน _onCameraFrame) กรอบจึงไม่ถูกรีเฟรชเลยตลอดช่วงนั้น
+  //
+  // ⚠️ เดิมตั้งไว้แค่ 1500ms แต่การเก็บเฟรมอาจกินเวลาได้ถึง ~2000ms เต็มๆ
+  // (_maxCollectFrames 40 เฟรม x _minCollectInterval 50ms) ถ้ากล้องส่งเฟรม
+  // ช้ากว่าปกติแค่ครั้งเดียว กรอบจะหมดอายุก่อนเก็บครบ 16 เฟรมที่ต้องใช้ปลด
+  // เงื่อนไขข้าม ML Kit — กลายเป็นล็อกกันเองสองทาง (เก็บเฟรมต่อไม่ได้เพราะ
+  // กรอบเก่า, กรอบก็รีเฟรชไม่ได้เพราะ ML Kit ยังไม่ถูกเรียก) ค้างอยู่ในสถานะ
+  // "กำลังพูด" ตลอดไปจนกว่าจะกด Reset เอง ขยายให้ยาวกว่ากรณีที่แย่ที่สุดของ
+  // การเก็บเฟรมพอสมควร ลดโอกาสเกิดเหตุนี้ (ดู _maxUtteranceDuration
+  // สำหรับตัวกันสำรองอีกชั้น เผื่อยังหลุดจากสาเหตุอื่น)
+  static const Duration _mouthRoiMaxAge = Duration(milliseconds: 4000);
   // กันไม่ให้การครอปซ้อนกัน และทำให้เฟรมเรียงตามเวลาเสมอ
   bool _isCollecting = false;
   DateTime? _lastCollectAt;
@@ -121,8 +130,17 @@ class _ScannerScreenState extends State<ScannerScreen>
 
   // ─── Speaking state machine ────────────────────────────────────────────────
   _SpeakingState _state = _SpeakingState.idle;
-  Timer? _silenceTimer; 
-  Timer? _wordTimer; 
+  Timer? _silenceTimer;
+  Timer? _wordTimer;
+  // ตัวกันสำรอง: ถ้าค้างอยู่ในสถานะ "กำลังพูด/หยุดชั่วคราว" นานผิดปกติไม่ว่า
+  // จะด้วยสาเหตุใด (เช่นบั๊ก _mouthRoiMaxAge ที่เคยเจอ หรือสาเหตุอื่นในอนาคต)
+  // บังคับรีเซ็ตกลับ idle เอง ไม่ต้องรอผู้ใช้กด Reset — เริ่มนับตอน
+  // _startUtterance ยกเลิกตอน _finalizeUtterance (ดู _onUtteranceWatchdogFired)
+  Timer? _utteranceWatchdogTimer;
+  // ยาวกว่า _targetCaptureMs และเวลาที่แย่ที่สุดของการเก็บเฟรมพอสมควร
+  // (_maxCollectFrames x _minCollectInterval ~2 วินาที) แต่ยังสั้นพอที่ผู้ใช้
+  // จะไม่รู้สึกว่าแอปค้างนานเกินไปก่อนฟื้นเอง
+  static const Duration _maxUtteranceDuration = Duration(seconds: 6);
   Duration _silenceGap = const Duration(milliseconds: 800);
   int _consecutiveSilenceFrames = 0;
   int _consecutiveSpeakFrames = 0;
@@ -981,6 +999,10 @@ class _ScannerScreenState extends State<ScannerScreen>
     _consecutiveSpeakFrames = 0;
     _consecutiveSilenceFrames = 0;
 
+    _utteranceWatchdogTimer?.cancel();
+    _utteranceWatchdogTimer =
+        Timer(_maxUtteranceDuration, _onUtteranceWatchdogFired);
+
     // 🟢 เคลียร์ frames ที่เก็บไว้
     _collectedLipFrames = [];
     _framesAtLastPartial = 0;
@@ -1111,7 +1133,28 @@ class _ScannerScreenState extends State<ScannerScreen>
     _scheduleNextWord();
   }
 
+  /// เรียกจาก [_utteranceWatchdogTimer] เมื่อค้างในสถานะ "กำลังพูด/หยุดชั่วคราว"
+  /// นานเกิน [_maxUtteranceDuration] — ทำสิ่งเดียวกับที่ปุ่ม Reset ทำ บวกเคลียร์
+  /// สถานะภายในที่ Reset ไม่ได้แตะ (เฟรมที่เก็บค้างไว้, ธง _isCollecting) ให้
+  /// ครบ เพราะเรียกเองโดยผู้ใช้ไม่รู้ตัวว่ามีปัญหา จึงต้องปลอดภัยกว่าการรีเซ็ต
+  /// ที่ผู้ใช้กดเอง
+  void _onUtteranceWatchdogFired() {
+    if (!mounted || _state == _SpeakingState.idle) return;
+    debugPrint(
+        '⚠️ ค้างในสถานะ "กำลังพูด" เกิน ${_maxUtteranceDuration.inSeconds} '
+        'วินาที กำลังรีเซ็ตกลับสถานะปกติ');
+    _wordTimer?.cancel();
+    _silenceTimer?.cancel();
+    _collectedLipFrames = [];
+    _isCollecting = false;
+    _isPredicting = false;
+    _consecutiveSilenceFrames = 0;
+    _consecutiveSpeakFrames = 0;
+    setState(() => _state = _SpeakingState.idle);
+  }
+
   void _finalizeUtterance() {
+    _utteranceWatchdogTimer?.cancel();
     _wordTimer?.cancel();
     _silenceTimer?.cancel();
 
@@ -1278,6 +1321,7 @@ class _ScannerScreenState extends State<ScannerScreen>
   void dispose() {
     _wordTimer?.cancel();
     _silenceTimer?.cancel();
+    _utteranceWatchdogTimer?.cancel();
     _apiStatusTimer?.cancel();
     _overlayData.dispose();
     _pulseCtrl.dispose();
@@ -1610,6 +1654,14 @@ class _ScannerScreenState extends State<ScannerScreen>
           children: [
             GestureDetector(
               onTap: () {
+                _utteranceWatchdogTimer?.cancel();
+                _wordTimer?.cancel();
+                _silenceTimer?.cancel();
+                _collectedLipFrames = [];
+                _isCollecting = false;
+                _isPredicting = false;
+                _consecutiveSilenceFrames = 0;
+                _consecutiveSpeakFrames = 0;
                 setState(() {
                   _words = [];
                   _state = _SpeakingState.idle;
