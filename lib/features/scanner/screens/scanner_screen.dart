@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
@@ -7,6 +9,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:image/image.dart' as img;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:flutter/foundation.dart';
 // 🟢 เพิ่ม Firebase 
@@ -70,30 +74,9 @@ class _ScannerScreenState extends State<ScannerScreen>
   // เริ่มต้นที่ต้อง fine-tune ต่อจากค่าจริงที่ debugPrint ออกมา
   static const double _mouthOpenThreshold = 0.15;
 
-  // ─── Mouth ROI (ต้องตรงกับตอนเทรนโมเดลเป๊ะ) ───────────────────────────────
-  //
-  // ค่าสามตัวนี้เป็นของโมเดล ไม่ใช่ของแอป เปลี่ยนได้ทุกครั้งที่เปลี่ยนไฟล์โมเดล
-  // จึงถามจาก server ตอนเริ่ม (ดู _syncModelConfig) แทนการฝังตายตัว — ไม่งั้น
-  // วันที่โมเดลรุ่นใหม่ใช้ค่าอื่น แอปจะส่งของผิดขนาดไปแล้วทำนายมั่วเงียบๆ
-  //
-  // ค่าที่ตั้งไว้ตรงนี้เป็นค่าสำรองของโมเดลปัจจุบัน ใช้ตอนที่ยังถาม server ไม่ได้
-
-  // ครอปกว้างกว่ากรอบริมฝีปากจริงเท่านี้เท่า ตามค่า MOUTH_SCALE ที่ใช้ตอนสร้าง
-  // training cache ครอปแคบหรือกว้างกว่านี้ โมเดลจะเห็นบริบทไม่เท่าที่เคยเห็นมา
-  //
-  // ⚠️ ค่านี้ยังไม่ได้ยืนยันกับผู้เทรน checkpoint ไม่ได้บอกมาด้วย จะอัปเดตเองได้
-  // ก็ต่อเมื่อผู้เทรนใส่ mouth_scale ลงใน preprocessing ของ checkpoint ให้
-  double _mouthScale = 2.4;
-  // ขนาดภาพที่โมเดลรับ ย่อตั้งแต่ฝั่งแอปเลย จะได้ไม่ต้องส่งภาพใหญ่เกินจำเป็น
-  // ข้ามเน็ตไปให้ server ย่อทีหลัง
-  int _roiSize = 112;
-  // จำนวนเฟรมที่โมเดลรับต่อหนึ่งคลิป
-  int _modelFrameCount = 16;
-
-  // ช่วงเวลาที่คลิปหนึ่งควรครอบคลุม ราวหนึ่งคำพูด — ตอนเทรน 16 เฟรมมาจาก
-  // วิดีโอต่อเนื่องซึ่งกินเวลาราวเท่านี้ ถ้าเก็บนานกว่านี้ โมเดลจะเห็นปากขยับ
-  // ช้ากว่าที่เรียนรู้มา และคำจริงจะถูกเจือจางด้วยช่วงที่ปากขยับหลังพูดจบ
-  static const int _targetCaptureMs = 900;
+  // ─── Mouth ROI (โหมดประโยค) ─────────────────────────────────────────────
+  // ขนาดภาพปากที่โมเดลประโยครับ ตาม pipeline_config.json ของโมเดล
+  static const int _roiSize = 112;
 
   // กรอบปากล่าสุดที่ ML Kit ตรวจได้ ใช้ครอปเฟรมระหว่างรอการตรวจรอบถัดไป
   Rect? _lastMouthRoi;
@@ -121,13 +104,6 @@ class _ScannerScreenState extends State<ScannerScreen>
   // 16 เฟรมกินเวลาราว 0.8 วินาที ใกล้เคียงตอนเทรนอยู่แล้ว ไม่ต้องเร็วกว่านี้
   static const Duration _minCollectInterval = Duration(milliseconds: 50);
 
-  // ขนาดด้านของกรอบครอป เฉลี่ยแบบถ่วงน้ำหนักตลอดหนึ่งประโยค (null = เริ่มใหม่)
-  //
-  // กรอบดิบที่คำนวณจาก contour ทุกเฟรมมีขนาดแกว่งแรงมาก: มันโตตามตอนอ้าปาก
-  // และกระโดดเป็นเท่าตัวเวลา ML Kit จับ contour พลาดไปเฟรมหนึ่ง ผลคือโมเดล
-  // เห็นภาพซูมเข้าๆ ออกๆ สลับกันภายในคลิปเดียว ซึ่งตอนเทรนไม่มีแบบนั้น
-  double? _roiSideEma;
-
   // ─── Speaking state machine ────────────────────────────────────────────────
   _SpeakingState _state = _SpeakingState.idle;
   Timer? _silenceTimer;
@@ -137,7 +113,7 @@ class _ScannerScreenState extends State<ScannerScreen>
   // บังคับรีเซ็ตกลับ idle เอง ไม่ต้องรอผู้ใช้กด Reset — เริ่มนับตอน
   // _startUtterance ยกเลิกตอน _finalizeUtterance (ดู _onUtteranceWatchdogFired)
   Timer? _utteranceWatchdogTimer;
-  // ยาวกว่า _targetCaptureMs และเวลาที่แย่ที่สุดของการเก็บเฟรมพอสมควร
+  // ยาวกว่าคำหนึ่งคำ และเวลาที่แย่ที่สุดของการเก็บเฟรมพอสมควร
   // (_maxCollectFrames x _minCollectInterval ~2 วินาที) แต่ยังสั้นพอที่ผู้ใช้
   // จะไม่รู้สึกว่าแอปค้างนานเกินไปก่อนฟื้นเอง
   static const Duration _maxUtteranceDuration = Duration(seconds: 6);
@@ -149,6 +125,9 @@ class _ScannerScreenState extends State<ScannerScreen>
   _ReadMode _mode = _ReadMode.word;
   bool get _isSentenceMode => _mode == _ReadMode.sentence;
   bool get _isChainMode => _mode == _ReadMode.chain;
+  // โหมด "คำ" และ "ต่อคำ" ใช้โมเดล v4 ตัวเดียวกัน ต่างกันแค่คำใหม่แทนที่หรือ
+  // ต่อท้าย — ทั้งการเก็บภาพหน้า การปรับเทียบ และความละเอียดกล้องใช้ร่วมกัน
+  bool get _usesV4 => _mode != _ReadMode.sentence;
 
   // ─── Chain mode ───────────────────────────────────────────────────────────
   // _words ในโหมดนี้ใช้แค่แสดงคำที่กำลังพูดอยู่/ข้อความสถานะชั่วคราว
@@ -161,7 +140,60 @@ class _ScannerScreenState extends State<ScannerScreen>
   String get _chainText => _chain.map((s) => s.word).join();
 
   /// มีผลที่บันทึก/อ่านออกเสียงได้หรือยัง (โหมดต่อคำดูจากประโยค ไม่ใช่ _hasWord)
-  bool get _hasResult => _isChainMode ? _chain.isNotEmpty : _hasWord;
+  bool get _hasResult => _usesV4 ? _chain.isNotEmpty : _hasWord;
+
+  // ─── VocaLip v4 (ใช้ในโหมดต่อคำ) ───────────────────────────────────────────
+  //
+  // v4 อ่านจากจุดบนใบหน้า server จึงต้องได้ "ภาพทั้งหน้า" ตั้งตรงไม่กลับด้าน
+  // ไม่ใช่ภาพปาก ค่าตั้งต้นข้างล่างเป็นค่าสำรอง ค่าจริงอ่านจาก /v4/model_info
+  V4ModelInfo _v4 = const V4ModelInfo(
+    version: '',
+    fps: 25.0,
+    minFrames: 4,
+    maxFrames: 40,
+    calibrationSeconds: 20.0,
+    cropSize: 192,
+    boxScale: 1.4,
+    jpegQuality: 80,
+  );
+  bool _v4InfoLoaded = false;
+  Duration get _v4FrameInterval =>
+      Duration(microseconds: (1e6 / _v4.fps).round());
+  // ตัวตรวจ "เริ่มพูด" ต้องเห็นปากอ้าจาก ML Kit 2 ครั้งติด ซึ่งช้ากว่าปากจริง
+  // เกือบครึ่งวินาที จึงเก็บภาพย้อนหลังไว้ตลอดเวลาแล้วเอามาต่อหน้าคำ
+  static const Duration _v4PreRoll = Duration(milliseconds: 600);
+  // ระหว่างพูด หยุด ML Kit ช่วงต้นคำให้เก็บภาพได้เต็มที่ แล้วค่อยเปิดกลับ
+  // เพื่อตรวจว่าปากหุบแล้ว (จบคำ)
+  static const Duration _v4SkipDetectionFor = Duration(milliseconds: 500);
+  static const Duration _v4MinWord = Duration(milliseconds: 400);
+  static const int _v4SilenceDetections = 2;
+  // โหมดอื่นใช้ low เพื่อให้ ML Kit เร็ว แต่ v4 ต้องเห็นรายละเอียดทั้งหน้า
+  // (หน้าในภาพ 320x240 กว้างราว 100-150px ถ้าครอป 192 จะเป็นภาพขยายเปล่าๆ)
+  static const ResolutionPreset _v4CameraPreset = ResolutionPreset.medium;
+  ResolutionPreset get _cameraPreset =>
+      _usesV4 ? _v4CameraPreset : ResolutionPreset.low;
+
+  Rect? _lastFaceRoi;
+  DateTime? _lastFaceRoiAt;
+  final List<_V4Frame> _v4Ring = [];
+  List<_V4Frame> _v4Frames = [];
+  DateTime? _v4LastCollectAt;
+  bool _v4Collecting = false;
+
+  V4Calibration? _v4Calib;
+  bool _calibrating = false;
+  bool _calibrationUploading = false;
+  DateTime? _calibStartedAt;
+  List<_V4Frame> _calibFrames = [];
+  static const Duration _calibInterval = Duration(milliseconds: 200);
+  static const String _calibrationScript =
+      'วันนี้ผมมาทดสอบระบบอ่านริมฝีปากภาษาไทย ตอนเช้าตื่นนอนแปดโมง อาบน้ำ '
+      'แล้วก็กินข้าว จากนั้นก็มาที่มหาวิทยาลัย อากาศวันนี้ค่อนข้างร้อน '
+      'ตอนเย็นจะไปออกกำลังกาย แล้วกลับบ้านไปพักผ่อน';
+
+  bool get _v4NeedsCalibration =>
+      _v4Calib == null ||
+      (_v4.version.isNotEmpty && _v4Calib!.modelVersion != _v4.version);
   // เพิ่มทุกครั้งที่สลับโหมด ผลทำนายที่ส่งไปก่อนสลับแล้วเพิ่งกลับมาจะเทียบ
   // ค่านี้แล้วทิ้งไป ไม่งั้นผลของโหมดเก่าจะโผล่ขึ้นในโหมดใหม่
   int _modeEpoch = 0;
@@ -197,7 +229,7 @@ class _ScannerScreenState extends State<ScannerScreen>
 
   // ─── Output ───────────────────────────────────────────────────────────────
   List<String> _words = [];
-  String get _displayText => _isChainMode ? _chainText : _words.join(' ');
+  String get _displayText => _usesV4 ? _chainText : _words.join(' ');
 
   // ข้อความที่ขึ้นแทนคำ เมื่อโมเดลเดาได้แต่ไม่มั่นใจพอ โมเดลถูกบังคับให้เลือก
   // 1 ใน 44 คำเสมอ แม้ผู้ใช้จะพูดคำนอกชุดหรือกล้องจับปากไม่ติด การโชว์คำที่
@@ -217,11 +249,6 @@ class _ScannerScreenState extends State<ScannerScreen>
   bool _isApiAvailable = false;
   bool _isPredicting = false;
 
-  // ทำนายผลระหว่างที่ยังพูดอยู่ทุกๆ เท่านี้เฟรม แล้วอัปเดตข้อความทันที
-  // ผู้ใช้จึงเห็นผลคืบหน้าไปเรื่อยๆ แทนที่จะจ้องจอว่างจนกว่าจะพูดจบ
-  static const int _partialPredictEveryFrames = 6;
-  int _framesAtLastPartial = 0;
-  Future<void>? _partialInFlight;
   // เวลาที่เริ่มเก็บเฟรมของประโยคปัจจุบัน ใช้คำนวณว่ากล้องเก็บได้กี่เฟรม/วินาที
   DateTime? _captureStartedAt;
   Timer? _apiStatusTimer;
@@ -342,7 +369,8 @@ class _ScannerScreenState extends State<ScannerScreen>
       (_) => _checkCameraWatchdog(),
     );
     _initCamera();
-    _checkApiStatus();
+    // โหลดค่าปรับเทียบให้เสร็จก่อนเช็ก server ไม่งั้นอาจชวนปรับเทียบทั้งที่มีอยู่แล้ว
+    _loadCalibration().whenComplete(_checkApiStatus);
     _apiStatusTimer = Timer.periodic(
       _apiStatusRecheckInterval,
       (_) => _checkApiStatus(),
@@ -368,21 +396,16 @@ class _ScannerScreenState extends State<ScannerScreen>
   /// ถามซ้ำทุกครั้งที่เช็ก health เพราะ server เปลี่ยนไฟล์โมเดลได้ระหว่างที่
   /// แอปยังเปิดอยู่ ถามไม่ได้ก็ใช้ค่าเดิมต่อไป ไม่ต้องทำอะไร
   Future<void> _syncModelConfig() async {
-    final config = await LipReadingApiService.fetchWordModelConfig();
-    if (config == null || !mounted) return;
-
-    final scale = config.mouthScale ?? _mouthScale;
-    if (config.frames == _modelFrameCount &&
-        config.roi == _roiSize &&
-        scale == _mouthScale) {
-      return;
+    if (!_v4InfoLoaded) {
+      final info = await LipReadingApiService.fetchV4ModelInfo();
+      if (info != null && mounted) {
+        _v4 = info;
+        _v4InfoLoaded = true;
+        debugPrint('⚙️ v4: $info');
+        _maybePromptCalibration();
+      }
     }
 
-    debugPrint('⚙️ ปรับค่าตามโมเดลบน server: $config '
-        '(เดิม frames=$_modelFrameCount roi=$_roiSize scale=$_mouthScale)');
-    _modelFrameCount = config.frames;
-    _roiSize = config.roi;
-    _mouthScale = scale;
   }
 
   Future<void> _initCamera() async {
@@ -405,7 +428,8 @@ class _ScannerScreenState extends State<ScannerScreen>
       // ทุกเฟรมต้องถูกแปลง YUV เป็น NV21 ด้วยลูปวนทีละพิกเซลใน Dart ก่อนส่งให้
       // ML Kit ต้นทุนจึงแปรผันตรงกับจำนวนพิกเซล ลดความละเอียดลงหนึ่งขั้นทำให้
       // ประมวลผลได้ถี่ขึ้นมาก ซึ่งสำคัญกว่าความคมชัดสำหรับการครอปภาพปาก
-      ResolutionPreset.low,
+      // (ยกเว้นโหมดต่อคำ/v4 ดู _v4CameraPreset)
+      _cameraPreset,
       enableAudio: false,
       imageFormatGroup: defaultTargetPlatform == TargetPlatform.android
           ? ImageFormatGroup.yuv420
@@ -429,6 +453,28 @@ class _ScannerScreenState extends State<ScannerScreen>
       _cameraReady = true;
       _isFrontCamera = index == 1;
     });
+  }
+
+  /// เปิดกล้องตัวเดิมใหม่ด้วยความละเอียดตามโหมดปัจจุบัน
+  ///
+  /// ต้องปิดตัวเก่าให้เสร็จก่อนเปิดใหม่ — กล้องตัวเดียวกันเปิดซ้อนสองครั้งไม่ได้
+  /// (ต่างจาก _flipCamera ที่สลับไปกล้องอีกตัว จึงเปิดตัวใหม่ก่อนปิดตัวเก่าได้)
+  Future<void> _reopenCamera() async {
+    final old = _cameraController;
+    if (old == null || _restartingCamera) return;
+    _restartingCamera = true;
+    try {
+      setState(() => _cameraReady = false);
+      _cameraController = null;
+      if (old.value.isStreamingImages) await old.stopImageStream();
+      await old.dispose();
+      await _startCamera(_cameras.length > 1 && _isFrontCamera ? 1 : 0);
+      _lastFrameAt = DateTime.now();
+    } catch (e) {
+      debugPrint('reopen camera failed: $e');
+    } finally {
+      _restartingCamera = false;
+    }
   }
 
   Future<void> _flipCamera() async {
@@ -495,7 +541,11 @@ class _ScannerScreenState extends State<ScannerScreen>
     //
     // ทำได้เพราะกรอบปากเลื่อนช้ากว่าการอ้า-หุบปากมาก ใช้กรอบที่ ML Kit ตรวจได้
     // ล่าสุดครอปเฟรมระหว่างทางจึงยอมรับได้ ส่วนจังหวะอ้า-หุบเก็บครบทุกเฟรม
-    _maybeCollectFrame(image, camera.sensorOrientation);
+    if (_usesV4) {
+      _maybeCollectV4Frame(image, camera.sensorOrientation);
+    } else {
+      _maybeCollectFrame(image, camera.sensorOrientation);
+    }
 
     // ─── เส้นทางช้า: ML Kit ทำได้ทีละงาน เฟรมที่มาระหว่างนั้นข้ามไป ──────────
     //
@@ -510,9 +560,9 @@ class _ScannerScreenState extends State<ScannerScreen>
     //
     // โหมดประโยคห้ามข้าม: เก็บนานหลายวินาที ต้องให้ ML Kit รีเฟรชกรอบปาก
     // และตรวจว่าหยุดพูดแล้ว (ประโยคจบด้วยความเงียบ ไม่ใช่ครบเวลา)
-    if (!_isSentenceMode &&
+    if (_usesV4 &&
         _state == _SpeakingState.speaking &&
-        _collectedLipFrames.length < _modelFrameCount) {
+        _v4WordElapsed < _v4SkipDetectionFor) {
       return;
     }
 
@@ -572,11 +622,19 @@ class _ScannerScreenState extends State<ScannerScreen>
         final mouthOpen = _estimateMouthOpen(face);
         _updateMouthState(mouthOpen, faceDetected: true, smiling: prob > 0.6);
 
-        // เก็บกรอบปากไว้ให้เส้นทางเร็วใช้ครอปเฟรมถัดๆ ไปจนกว่าจะตรวจรอบใหม่
-        final roi = _mouthRoiRect(face);
-        if (roi != null) {
-          _lastMouthRoi = roi;
-          _lastMouthRoiAt = DateTime.now();
+        // เก็บกรอบไว้ให้เส้นทางเร็วใช้ครอปเฟรมถัดๆ ไปจนกว่าจะตรวจรอบใหม่
+        if (_usesV4) {
+          final box = face.boundingBox;
+          final side = max(box.width, box.height) * _v4.boxScale;
+          _lastFaceRoi =
+              Rect.fromCenter(center: box.center, width: side, height: side);
+          _lastFaceRoiAt = DateTime.now();
+        } else {
+          final roi = _sentenceRoiRect(face);
+          if (roi != null) {
+            _lastMouthRoi = roi;
+            _lastMouthRoiAt = DateTime.now();
+          }
         }
 
         // คำนวณจุดกึ่งกลางปาก "ตอนนี้เลย" — ครั้งเดียวต่อการตรวจจับหนึ่งรอบ
@@ -628,12 +686,92 @@ class _ScannerScreenState extends State<ScannerScreen>
     }
 
     if (!mounted || _state != _SpeakingState.speaking) return;
-    if (_shouldFinalizeCapture()) {
-      _finalizeUtterance();
-    } else if (!_isSentenceMode) {
-      // โมเดลประโยคเป็น GRU สองทิศ ต้องเห็นทั้งประโยคก่อนถึงทายได้
-      _maybePredictPartial();
+    if (_shouldFinalizeCapture()) _finalizeUtterance();
+  }
+
+  /// เวลาตั้งแต่ตรวจเจอว่าเริ่มพูด (ไม่รวมเฟรมย้อนหลัง)
+  Duration get _v4WordElapsed {
+    final start = _captureStartedAt;
+    return start == null ? Duration.zero : DateTime.now().difference(start);
+  }
+
+  Duration get _calibElapsed {
+    final start = _calibStartedAt;
+    return start == null ? Duration.zero : DateTime.now().difference(start);
+  }
+
+  /// เก็บภาพทั้งหน้าสำหรับ v4 — ทำงานต่างกันตามสถานะ:
+  /// - ปรับเทียบ: เก็บ 5 ภาพ/วินาที จนครบเวลา
+  /// - กำลังพูด: เก็บตามเป้า fps ของโมเดล จนจบคำหรือครบความยาวสูงสุด
+  /// - รอ: เก็บวนไว้แค่ช่วงสั้นๆ ล่าสุด (เอาไปต่อหน้าคำตอนเริ่มพูด)
+  void _maybeCollectV4Frame(CameraImage image, int rotationDegrees) {
+    if (_v4Collecting || !_isApiAvailable) return;
+    final speaking = _state == _SpeakingState.speaking;
+    // ระหว่างรอผลไม่ต้องเก็บ ภาพช่วงนั้นไม่ได้ใช้ทำอะไร
+    if (!_calibrating && !speaking && _state != _SpeakingState.idle) return;
+    if (_calibrating && _calibrationUploading) return;
+
+    final now = DateTime.now();
+    final interval = _calibrating ? _calibInterval : _v4FrameInterval;
+    final last = _v4LastCollectAt;
+    if (last != null && now.difference(last) < interval) return;
+
+    final roi = _lastFaceRoi;
+    final detectedAt = _lastFaceRoiAt;
+    if (roi == null || detectedAt == null) return;
+    if (now.difference(detectedAt) > _mouthRoiMaxAge) return;
+
+    _v4Collecting = true;
+    _v4LastCollectAt = now;
+    try {
+      final rgb = _cropMouthToRgb(image, roi, rotationDegrees,
+          size: _v4.cropSize);
+      if (rgb == null) return;
+      final frame = _V4Frame(rgb, _v4.cropSize, now.millisecondsSinceEpoch);
+
+      if (_calibrating) {
+        _calibFrames.add(frame);
+      } else if (speaking) {
+        _v4Frames.add(frame);
+        final clipMs = frame.tMs - _v4Frames.first.tMs;
+        if (clipMs + interval.inMilliseconds >= _v4.maxSeconds * 1000) {
+          _finalizeUtterance();
+        }
+      } else {
+        _v4Ring.add(frame);
+        while (_v4Ring.isNotEmpty &&
+            frame.tMs - _v4Ring.first.tMs > _v4PreRoll.inMilliseconds) {
+          _v4Ring.removeAt(0);
+        }
+      }
+    } catch (e) {
+      debugPrint('v4 frame collection error: $e');
+    } finally {
+      _v4Collecting = false;
     }
+  }
+
+  /// เข้ารหัส JPEG นอก UI thread — 192x192 หลายสิบภาพทำบน UI thread จะกระตุก
+  static Future<List<Uint8List>> _encodeJpegs(
+      List<_V4Frame> frames, int quality) {
+    return Isolate.run(() => [
+          for (final f in frames)
+            img.encodeJpg(
+              img.Image.fromBytes(
+                width: f.size,
+                height: f.size,
+                bytes: f.rgb.buffer,
+                numChannels: 3,
+              ),
+              quality: quality,
+            ),
+        ]);
+  }
+
+  /// เวลาของแต่ละเฟรมนับจากเฟรมแรก (ms) — server ใช้ยืดเป็น 25 fps ตามเวลาจริง
+  static List<double> _relativeTimestamps(List<_V4Frame> frames) {
+    final t0 = frames.first.tMs;
+    return [for (final f in frames) (f.tMs - t0).toDouble()];
   }
 
   /// เก็บครบสำหรับหนึ่งคำแล้วหรือยัง
@@ -644,14 +782,9 @@ class _ScannerScreenState extends State<ScannerScreen>
   /// มันต้องใกล้เคียงกับตอนเทรน (16 เฟรมต่อคำ ราว 0.6 วินาที)
   bool _shouldFinalizeCapture() {
     if (_collectedLipFrames.length >= _maxFrames) return true;
-    if (_isSentenceMode) {
-      // ปกติจบด้วยความเงียบ ตรงนี้แค่เพดานกันส่งภาพใหญ่เกินไป
-      final elapsed = _captureMs;
-      return elapsed != null && elapsed >= _sentenceMaxCaptureMs;
-    }
-    if (_collectedLipFrames.length < _modelFrameCount) return false;
+    // ปกติจบด้วยความเงียบ ตรงนี้แค่เพดานกันส่งภาพใหญ่เกินไป
     final elapsed = _captureMs;
-    return elapsed != null && elapsed >= _targetCaptureMs;
+    return elapsed != null && elapsed >= _sentenceMaxCaptureMs;
   }
 
   /// จุดกึ่งกลางริมฝีปาก ในพิกัดดิบของ ML Kit (ยังไม่ scale ไปที่ผืนวาด) —
@@ -693,75 +826,6 @@ class _ScannerScreenState extends State<ScannerScreen>
     return Offset(avgX / lineCenters.length, avgY / lineCenters.length);
   }
 
-  /// กรอบจัตุรัสรอบปาก ในระบบพิกัดเดียวกับที่ ML Kit คืนค่ามา
-  /// (คือภาพที่หมุนตั้งขึ้นแล้ว ไม่ใช่บัฟเฟอร์ดิบของกล้อง)
-  ///
-  /// คืน null เมื่อหาตำแหน่งปากไม่ได้ ซึ่งแปลว่าเฟรมนั้นข้ามไปดีกว่าเดา
-  Rect? _mouthRoiRect(Face face) {
-    if (_isSentenceMode) return _sentenceRoiRect(face);
-
-    double? minX, minY, maxX, maxY;
-
-    void include(num x, num y) {
-      minX = (minX == null || x < minX!) ? x.toDouble() : minX;
-      maxX = (maxX == null || x > maxX!) ? x.toDouble() : maxX;
-      minY = (minY == null || y < minY!) ? y.toDouble() : minY;
-      maxY = (maxY == null || y > maxY!) ? y.toDouble() : maxY;
-    }
-
-    for (final type in const [
-      FaceContourType.upperLipTop,
-      FaceContourType.upperLipBottom,
-      FaceContourType.lowerLipTop,
-      FaceContourType.lowerLipBottom,
-    ]) {
-      final points = face.contours[type]?.points;
-      if (points == null) continue;
-      for (final p in points) {
-        include(p.x, p.y);
-      }
-    }
-
-    // เผื่อบางเฟรมที่ ML Kit ให้ contour ไม่ครบ ยังพอถูไถด้วยจุดมุมปากได้
-    if (minX == null) {
-      for (final type in const [
-        FaceLandmarkType.leftMouth,
-        FaceLandmarkType.rightMouth,
-        FaceLandmarkType.bottomMouth,
-      ]) {
-        final landmark = face.landmarks[type];
-        if (landmark != null) {
-          include(landmark.position.x, landmark.position.y);
-        }
-      }
-    }
-    if (minX == null) return null;
-
-    // ใช้ด้านที่ยาวกว่าเป็นด้านของจัตุรัส เพราะกรอบปากแบนมาก (กว้าง >> สูง)
-    // ถ้าใช้ความสูงจะได้ครอปที่เล็กจนไม่เหลือบริบทรอบปากเลย
-    final rawSide = max(maxX! - minX!, maxY! - minY!) * _mouthScale;
-    if (rawSide <= 0) return null;
-
-    // จุดกึ่งกลางยังตามปากทุกเฟรมเหมือนเดิม ปรับให้นิ่งเฉพาะ "ขนาด" เพราะขนาด
-    // คือสิ่งที่กระโดดจนภาพซูมเข้าออก ส่วนตำแหน่งต้องตามหัวที่ขยับอยู่แล้ว
-    final ema = _roiSideEma;
-    final double side;
-    if (ema == null) {
-      side = rawSide;
-    } else {
-      // จำกัดช่วงก่อนเอาไปเฉลี่ย เพื่อไม่ให้เฟรมที่ตรวจพลาดเฟรมเดียวลากขนาด
-      // ของทั้งประโยคตามไปด้วย
-      side = ema * 0.8 + rawSide.clamp(ema * 0.75, ema * 1.33) * 0.2;
-    }
-    _roiSideEma = side;
-
-    return Rect.fromCenter(
-      center: Offset((minX! + maxX!) / 2, (minY! + maxY!) / 2),
-      width: side,
-      height: side,
-    );
-  }
-
   /// ครอปแบบที่โมเดลประโยคเทรนมา: กึ่งกลางปาก ด้าน = ระยะห่างตา x 1.65
   ///
   /// ตอนเทรนใช้ MediaPipe เฉลี่ยมุมตาสองมุมของแต่ละข้าง ส่วน ML Kit ให้จุด
@@ -782,8 +846,9 @@ class _ScannerScreenState extends State<ScannerScreen>
   ///
   /// สุ่มจุดแบบ nearest-neighbour ทีละพิกเซลปลายทาง จึงไม่ต้องสร้างภาพสีเต็ม
   /// เฟรมกลางทาง — เสียเวลาแค่ราว 12,500 พิกเซลต่อเฟรมแทนที่จะเป็นหลักแสน
-  Uint8List? _cropMouthToRgb(
-      CameraImage image, Rect roi, int rotationDegrees) {
+  Uint8List? _cropMouthToRgb(CameraImage image, Rect roi, int rotationDegrees,
+      {int? size}) {
+    final int outSize = size ?? _roiSize;
     final planes = image.planes;
     if (planes.isEmpty) return null;
 
@@ -814,13 +879,13 @@ class _ScannerScreenState extends State<ScannerScreen>
       uOffset = vOffset + 1;
     }
 
-    final out = Uint8List(_roiSize * _roiSize * 3);
+    final out = Uint8List(outSize * outSize * 3);
     int o = 0;
 
-    for (int oy = 0; oy < _roiSize; oy++) {
-      final double upY = roi.top + (oy + 0.5) * roi.height / _roiSize;
-      for (int ox = 0; ox < _roiSize; ox++) {
-        final double upX = roi.left + (ox + 0.5) * roi.width / _roiSize;
+    for (int oy = 0; oy < outSize; oy++) {
+      final double upY = roi.top + (oy + 0.5) * roi.height / outSize;
+      for (int ox = 0; ox < outSize; ox++) {
+        final double upX = roi.left + (ox + 0.5) * roi.width / outSize;
 
         // ย้อนการหมุนที่ ML Kit ทำไว้ กลับไปเป็นพิกัดในบัฟเฟอร์ดิบ
         final int rx, ry;
@@ -868,19 +933,6 @@ class _ScannerScreenState extends State<ScannerScreen>
   // เดิมตรงนี้เข้ารหัสพิกเซลเป็นไฟล์ PNG ก่อนส่ง แล้ว server ก็ถอดกลับมาเป็น
   // พิกเซลชุดเดิม เป็นงานหนักทั้งสองฝั่งที่ไม่ได้อะไรกลับมา — และหนักพอที่จะ
   // ทำให้ UI thread ค้างจน ML Kit ตรวจหน้าไม่ได้ ตอนนี้ส่งพิกเซลดิบไปตรงๆ
-
-  /// เลือกเฟรมให้เหลือ 16 เฟรมกระจายเท่าๆ กันก่อนส่ง
-  ///
-  /// server เลือกให้เองได้อยู่แล้ว แต่ทำตรงนี้ก่อนช่วยลดขนาดที่ต้องส่งข้ามเน็ต
-  /// ลงเกินครึ่งเมื่อเก็บมาเต็ม 40 เฟรม ซึ่งมีผลกับเวลารอโดยตรง
-  List<Uint8List> _framesForModel(List<Uint8List> frames) {
-    if (frames.length <= _modelFrameCount) return frames;
-    final step = (frames.length - 1) / (_modelFrameCount - 1);
-    return List.generate(
-      _modelFrameCount,
-      (i) => frames[(i * step).round()],
-    );
-  }
 
   InputImage? _buildInputImage(CameraImage image, CameraDescription camera) {
     try {
@@ -1033,6 +1085,9 @@ class _ScannerScreenState extends State<ScannerScreen>
       isSpeaking: _state == _SpeakingState.speaking,
     );
 
+    // ระหว่างปรับเทียบผู้ใช้อ่านข้อความยาวๆ ห้ามนับเป็นคำพูด
+    if (_calibrating) return;
+
     final isMouthOpen = mouthOpen >= _mouthOpenThreshold;
 
     switch (_state) {
@@ -1053,7 +1108,13 @@ class _ScannerScreenState extends State<ScannerScreen>
           _silenceTimer?.cancel();
         } else {
           _consecutiveSilenceFrames++;
-          if (_consecutiveSilenceFrames >= _silenceFrameThreshold) {
+          if (_usesV4) {
+            // v4 รับคำละไม่เกิน 1.6 วินาที รอเงียบนานแบบโหมดอื่นไม่ได้
+            if (_consecutiveSilenceFrames >= _v4SilenceDetections &&
+                _v4WordElapsed >= _v4MinWord) {
+              _finalizeUtterance();
+            }
+          } else if (_consecutiveSilenceFrames >= _silenceFrameThreshold) {
             _onSilenceDetected();
           }
         }
@@ -1073,6 +1134,8 @@ class _ScannerScreenState extends State<ScannerScreen>
   void _startUtterance() {
     _consecutiveSpeakFrames = 0;
     _consecutiveSilenceFrames = 0;
+    // ยังพูดต่อ — ประโยคยังไม่จบ อย่าเพิ่งอ่านออกเสียง
+    _sentenceEndTimer?.cancel();
 
     _utteranceWatchdogTimer?.cancel();
     _utteranceWatchdogTimer =
@@ -1080,7 +1143,9 @@ class _ScannerScreenState extends State<ScannerScreen>
 
     // 🟢 เคลียร์ frames ที่เก็บไว้
     _collectedLipFrames = [];
-    _framesAtLastPartial = 0;
+    // v4: เอาภาพย้อนหลังมาต่อหน้าคำ เพราะตรวจเจอว่าพูดช้ากว่าปากขยับจริง
+    _v4Frames = List.of(_v4Ring);
+    _v4Ring.clear();
     _captureStartedAt = DateTime.now();
 
     if (!_isApiAvailable) {
@@ -1097,9 +1162,6 @@ class _ScannerScreenState extends State<ScannerScreen>
       _words = [];
       _hasWord = false;
     });
-    // เริ่มประโยคใหม่ก็เริ่มวัดขนาดกรอบใหม่ ไม่ลากค่าจากประโยคก่อนมา เพราะ
-    // ผู้ใช้อาจขยับเข้าออกจากกล้องระหว่างนั้น
-    _roiSideEma = null;
 
     if (!_isApiAvailable) {
       _scheduleNextWord();
@@ -1131,71 +1193,10 @@ class _ScannerScreenState extends State<ScannerScreen>
     await tts.speakWord(word, emotion: _currentEmotion);
   }
 
-  /// ยิง prediction ระหว่างพูดเป็นระยะ เพื่อให้ข้อความทยอยขึ้นระหว่างที่ยัง
-  /// พูดอยู่ ไม่ต้องรอจนพูดจบ
-  void _maybePredictPartial() {
-    if (_isPredicting) return;
-
-    // ยังไม่ครบจำนวนเฟรมที่โมเดลรับ ก็ยังไม่ต้องยิง — ถ้ายิงไปตอนนี้ server
-    // จะเติมเฟรมสุดท้ายซ้ำจนครบ ซึ่งเฟรมที่ซ้ำกันไม่มีการขยับ ค่า motion เลย
-    // ตกลงเกือบสี่เท่า (วัดได้ 0.047 -> 0.013) และ confidence ตกตาม
-    // ผลระหว่างทางเลยถูกปฏิเสธเกือบทุกครั้ง เสียเวลาเปล่าทั้งสองฝั่ง
-    if (_collectedLipFrames.length < _modelFrameCount) return;
-
-    if (_collectedLipFrames.length - _framesAtLastPartial <
-        _partialPredictEveryFrames) {
-      return;
-    }
-    _framesAtLastPartial = _collectedLipFrames.length;
-    _partialInFlight = _predictPartial();
-  }
-
   /// เวลาที่ใช้เก็บเฟรมชุดปัจจุบัน ส่งไปให้ server บันทึกไว้ดูอัตราเฟรมต่อวินาที
   int? get _captureMs => _captureStartedAt == null
       ? null
       : DateTime.now().difference(_captureStartedAt!).inMilliseconds;
-
-  Future<void> _predictPartial() async {
-    if (_isPredicting) return;
-    _isPredicting = true;
-    final epoch = _modeEpoch;
-
-    // สำเนา ณ ขณะนี้ เพราะรายการจริงยังโตต่อระหว่างที่รอผลอยู่
-    final snapshot = _framesForModel(List<Uint8List>.of(_collectedLipFrames));
-    final captureMs = _captureMs;
-
-    try {
-      final result = await LipReadingApiService.predictWord(
-        snapshot,
-        roiSize: _roiSize,
-        captureMs: captureMs,
-        collectedFrames: _collectedLipFrames.length,
-        isFinal: false,
-      );
-
-      // แสดงเฉพาะตอนที่ยังพูดอยู่ ถ้าจบไปแล้วปล่อยให้ผลสุดท้ายเป็นตัวตัดสิน
-      //
-      // ผลระหว่างทางที่ไม่มั่นใจจะเงียบไว้เฉยๆ ไม่ขึ้นข้อความแจ้งปัญหา เพราะ
-      // ตอนพูดยังไม่จบมันเดาไม่ออกเป็นเรื่องปกติ ถ้าขึ้นแล้วหายไปๆ มาๆ ระหว่าง
-      // พูดจะกวนสายตา ปล่อยให้ผลสุดท้ายเป็นคนบอกว่าอ่านไม่ได้จริงหรือเปล่า
-      if (mounted &&
-          epoch == _modeEpoch &&
-          result != null &&
-          !result.lowConfidence &&
-          result.word.isNotEmpty &&
-          _state == _SpeakingState.speaking) {
-        setState(() {
-          _words = [result.word];
-          _hasWord = true;
-        });
-      }
-    } catch (e) {
-      // ผลระหว่างทางพลาดได้ ไม่ต้องรบกวนผู้ใช้ เดี๋ยวรอบหน้าหรือผลสุดท้ายก็มาแทน
-      debugPrint('partial prediction skipped: $e');
-    } finally {
-      _isPredicting = false;
-    }
-  }
 
   void _onSilenceDetected() {
     if (_state != _SpeakingState.speaking) return;
@@ -1229,31 +1230,55 @@ class _ScannerScreenState extends State<ScannerScreen>
   /// ล้างสถานะภายในของประโยคที่ค้างอยู่ทั้งหมด (ไม่แตะข้อความที่แสดง)
   void _clearUtteranceState() {
     _utteranceWatchdogTimer?.cancel();
+    _sentenceEndTimer?.cancel();
+    _sentenceSpoken = false;
     _wordTimer?.cancel();
     _silenceTimer?.cancel();
     _collectedLipFrames = [];
+    _v4Frames = [];
     _isCollecting = false;
     _isPredicting = false;
     _consecutiveSilenceFrames = 0;
     _consecutiveSpeakFrames = 0;
   }
 
-  void _setMode(_ReadMode mode) {
+  Future<void> _setMode(_ReadMode mode) async {
     if (mode == _mode) return;
+    final presetBefore = _cameraPreset;
     _modeEpoch++;
     _clearUtteranceState();
-    // กรอบปากของอีกโหมดขนาดไม่เท่ากัน ห้ามลากมาใช้ต่อ
+    _calibTicker?.cancel();
+    // กรอบของอีกโหมดขนาดไม่เท่ากัน ห้ามลากมาใช้ต่อ
     _lastMouthRoi = null;
     _lastMouthRoiAt = null;
-    _roiSideEma = null;
+    _lastFaceRoi = null;
+    _lastFaceRoiAt = null;
+    _v4Ring.clear();
     setState(() {
       _mode = mode;
       _words = [];
       _hasWord = false;
       _chain = [];
       _focusedSlot = null;
+      _calibrating = false;
+      _calibrationUploading = false;
+      _calibFrames = [];
       _state = _SpeakingState.idle;
     });
+
+    if (_cameraPreset != presetBefore) await _reopenCamera();
+    _maybePromptCalibration();
+  }
+
+  // ชวนปรับเทียบแค่ครั้งเดียวต่อการเปิดหน้านี้ ถ้าผู้ใช้กดข้าม จะไม่ถามซ้ำทุกครั้ง
+  // ที่สลับโหมด (ยังกด "ปรับเทียบ" เองได้ตลอด)
+  bool _calibPromptShown = false;
+
+  void _maybePromptCalibration() {
+    if (_calibPromptShown || !mounted) return;
+    if (!_usesV4 || !_isApiAvailable || !_v4NeedsCalibration) return;
+    _calibPromptShown = true;
+    _promptCalibration();
   }
 
   void _finalizeUtterance() {
@@ -1261,9 +1286,19 @@ class _ScannerScreenState extends State<ScannerScreen>
     _wordTimer?.cancel();
     _silenceTimer?.cancel();
 
+    if (_isApiAvailable && _usesV4) {
+      if (_v4Frames.length >= _v4.minFrames) {
+        _predictV4WithApi();
+      } else {
+        _v4Frames = [];
+        setState(() => _state = _SpeakingState.idle);
+      }
+      return;
+    }
+
     // 🟢 ถ้า API พร้อม → ส่ง frames ไปทำ prediction
     if (_isApiAvailable && _collectedLipFrames.isNotEmpty) {
-      _isSentenceMode ? _predictSentenceWithApi() : _predictWithApi();
+      _predictSentenceWithApi();
       return;
     }
 
@@ -1278,82 +1313,61 @@ class _ScannerScreenState extends State<ScannerScreen>
     });
   }
 
-  /// 🟢 ส่ง lip frames ไป API แล้วรับข้อความกลับมา
-  Future<void> _predictWithApi() async {
-    // รอผลระหว่างทางที่อาจกำลังวิ่งอยู่ให้จบก่อน ไม่งั้นรอบสุดท้ายจะถูกข้าม
-    // เพราะติด _isPredicting แล้วประโยคนั้นจะจบลงด้วยผลที่ยังไม่สมบูรณ์
+  /// โหมดต่อคำ: ส่งภาพหน้าของคำนี้ไปให้ v4 แล้วต่อผลท้ายประโยค
+  Future<void> _predictV4WithApi() async {
+    if (!mounted || _isPredicting) return;
     final epoch = _modeEpoch;
-    await _partialInFlight;
-    if (!mounted || _isPredicting || epoch != _modeEpoch) return;
+    final frames = List<_V4Frame>.of(_v4Frames);
+    _v4Frames = [];
 
     setState(() {
       _isPredicting = true;
       _state = _SpeakingState.finalizing;
-      // ถ้ามีผลระหว่างทางขึ้นอยู่แล้ว คงไว้ให้ผู้ใช้อ่านต่อระหว่างรอผลสุดท้าย
-      // ดีกว่าล้างทิ้งแล้วโชว์ข้อความรอซึ่งเหมือนถอยหลัง
-      if (_words.isEmpty) _words = ['กำลังอ่านปาก...'];
+      _words = ['กำลังอ่านปาก...'];
     });
 
     try {
-      final result = await LipReadingApiService.predictWord(
-        _framesForModel(_collectedLipFrames),
-        roiSize: _roiSize,
-        captureMs: _captureMs,
-        collectedFrames: _collectedLipFrames.length,
-        isFinal: true,
+      final sw = Stopwatch()..start();
+      final jpegs = await _encodeJpegs(frames, _v4.jpegQuality);
+      final encodeMs = sw.elapsedMilliseconds;
+      if (kDebugMode) _dumpDebugFrames(jpegs);
+
+      final result = await LipReadingApiService.predictWordV4(
+        jpegs,
+        _relativeTimestamps(frames),
+        calibration: _v4NeedsCalibration ? null : _v4Calib,
       );
-
-      // ดู top-3 เต็มๆ ได้ที่ console ของ server เมื่อเปิด VOCALIP_DEBUG=1
-      if (result != null) debugPrint('🔮 $result');
-
+      final p = result.prediction;
+      final kb = jpegs.fold<int>(0, (s, j) => s + j.length) ~/ 1024;
+      debugPrint('🔮 v4 ${p ?? 'HTTP ${result.statusCode} ${result.detail}'} | '
+          '${frames.length} frames ${kb}KB @ ${result.captureFps} fps, '
+          'face ${result.faceRatio}, calibrated ${result.calibrated}, '
+          'encode ${encodeMs}ms total ${sw.elapsedMilliseconds}ms');
       if (!mounted || epoch != _modeEpoch) return;
 
-      // ปากไม่ได้ขยับจริง (ติดแค่ motion gate) ถือว่ายังไม่มีใครพูดอะไร จึงกลับ
-      // ไปรอเฉยๆ ไม่ขึ้นข้อความว่าอ่านไม่ได้ เพราะไม่มีอะไรให้อ่านตั้งแต่แรก
-      // การขึ้นข้อความตรงนี้จะกลายเป็นเตือนผิดทุกครั้งที่ผู้ใช้แค่ขยับหน้า
-      final idleOnly = result != null &&
-          result.lowConfidence &&
-          result.rejectReasons.length == 1 &&
-          result.rejectReasons.first == 'motion';
-
-      if (_isChainMode) {
-        _appendChainWord(result, idleOnly: idleOnly);
+      if (result.statusCode == 422) {
+        setState(() => _words = ['ไม่เห็นใบหน้าชัด — หันหน้าเข้ากล้องตรงๆ']);
         return;
       }
-
-      // เดาได้แต่ไม่มั่นใจพอ ให้บอกตรงๆ ว่าอ่านไม่ได้ ดีกว่าโชว์คำที่เดามั่ว
-      // ซึ่งผู้ใช้แยกไม่ออกว่าอันไหนอ่านได้จริง
-      final word = (result != null &&
-              result.word.isNotEmpty &&
-              !result.lowConfidence)
-          ? result.word
-          : null;
-
-      setState(() {
-        _words = word != null
-            ? [word]
-            : (idleOnly ? <String>[] : [_unreadableMessage]);
-        _hasWord = word != null;
-      });
-
-      if (word != null) {
-        await _tts.speak(word, emotion: _currentEmotion);
+      if (result.statusCode == 400 &&
+          (result.detail ?? '').contains('feat_mean')) {
+        await _clearCalibration();
+        setState(() => _words = ['โมเดลเปลี่ยนรุ่น — ต้องปรับเทียบใหม่']);
+        return;
       }
+      final idleOnly = p != null &&
+          p.rejectReasons.length == 1 &&
+          p.rejectReasons.first == 'motion';
+      _appendChainWord(p, idleOnly: idleOnly);
     } catch (e) {
-      debugPrint('❌ API prediction error: $e');
+      debugPrint('❌ v4 prediction error: $e');
       if (mounted && epoch == _modeEpoch) {
-        setState(() {
-          _words = [_unreadableMessage];
-          _hasWord = false;
-        });
+        setState(() => _words = [_unreadableMessage]);
       }
     } finally {
       if (mounted && epoch == _modeEpoch) {
-        _collectedLipFrames = [];
         setState(() => _isPredicting = false);
-        // กลับไปพร้อมรับคำถัดไปให้เร็ว ผลที่แสดงยังอยู่บนจอต่อไปจนกว่าจะมีคำใหม่
-        // เดิมรอ 4 วินาที ซึ่งเป็นช่วงที่พูดคำต่อไปแล้วแอปไม่รับรู้เลย
-        Future.delayed(const Duration(milliseconds: 600), () {
+        Future.delayed(const Duration(milliseconds: 300), () {
           if (mounted && epoch == _modeEpoch) {
             setState(() => _state = _SpeakingState.idle);
           }
@@ -1362,36 +1376,242 @@ class _ScannerScreenState extends State<ScannerScreen>
     }
   }
 
-  /// โหมดต่อคำ: เพิ่มคำที่ทายได้ต่อท้ายประโยค พร้อม 3 ตัวเลือกไว้ให้แก้
-  ///
-  /// คำที่ต่ำกว่าเกณฑ์ก็ใส่ด้วย แต่ติดธงไม่แน่ใจ — ที่เกณฑ์ปัจจุบันคำส่วนใหญ่
-  /// ไม่ผ่าน ถ้าทิ้งหมดแบบโหมดคำ ประโยคแทบไม่ขยับ ผู้ใช้เลือกแก้เองได้อยู่แล้ว
-  /// ไม่อ่านออกเสียงทีละคำ เพราะคำแรกผิดบ่อย ให้กด Voice อ่านทั้งประโยคทีเดียว
-  void _appendChainWord(WordPrediction? result, {required bool idleOnly}) {
+  /// เซฟภาพที่ส่งไปล่าสุด 3 ภาพ (ต้น/กลาง/ท้าย) ไว้ดูตอนพัฒนา — เฉพาะ debug
+  /// build และอยู่ในพื้นที่ของแอปเอง ดึงออกมาดูด้วย `adb shell run-as`
+  void _dumpDebugFrames(List<Uint8List> jpegs) {
+    try {
+      final picks = {0, jpegs.length ~/ 2, jpegs.length - 1};
+      var i = 0;
+      for (final k in picks) {
+        File('${Directory.systemTemp.path}/v4_last_${i++}.jpg')
+            .writeAsBytesSync(jpegs[k]);
+      }
+    } catch (e) {
+      debugPrint('v4 debug dump failed: $e');
+    }
+  }
+
+  // ─── v4 calibration ───────────────────────────────────────────────────────
+
+  /// แยกค่าปรับเทียบตามบัญชีผู้ใช้ ถ้ามีคนอื่นล็อกอินเครื่องเดียวกันจะไม่ปนกัน
+  String get _calibPrefsKey =>
+      'v4_calibration_${FirebaseAuth.instance.currentUser?.uid ?? 'guest'}';
+
+  Future<void> _loadCalibration() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_calibPrefsKey);
+      if (raw == null) return;
+      _v4Calib = V4Calibration.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (e) {
+      debugPrint('load v4 calibration failed: $e');
+    }
+  }
+
+  Future<void> _saveCalibration(V4Calibration calibration) async {
+    _v4Calib = calibration;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_calibPrefsKey, jsonEncode(calibration.toJson()));
+    } catch (e) {
+      debugPrint('save v4 calibration failed: $e');
+    }
+  }
+
+  Future<void> _clearCalibration() async {
+    _v4Calib = null;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_calibPrefsKey);
+    } catch (_) {}
+  }
+
+  Timer? _calibTicker;
+
+  void _startCalibration() {
+    if (!_usesV4 || _calibrating) return;
+    _clearUtteranceState();
+    _calibTicker?.cancel();
     setState(() {
-      if (idleOnly) {
-        _words = [];
-      } else if (result == null || result.topK.isEmpty) {
-        _words = [_unreadableMessage];
-      } else if (_chain.length >= _chainMaxWords) {
-        _words = ['ประโยคเต็มแล้ว ($_chainMaxWords คำ) ลบหรือ Reset ก่อน'];
+      _calibrating = true;
+      _calibrationUploading = false;
+      _calibFrames = [];
+      _calibStartedAt = DateTime.now();
+      _state = _SpeakingState.idle;
+      _words = [];
+    });
+    final total = Duration(
+        milliseconds: (_v4.calibrationSeconds * 1000).round());
+    _calibTicker = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      if (!mounted || !_calibrating) return;
+      if (_calibElapsed >= total) {
+        _finishCalibration();
       } else {
-        _chain = [
-          ..._chain,
-          _WordSlot(result.topK, uncertain: result.lowConfidence),
-        ];
-        _focusedSlot = null;
-        _words = [];
+        setState(() {}); // อัปเดตแถบเวลา
       }
     });
   }
 
+  void _cancelCalibration() {
+    _calibTicker?.cancel();
+    if (!mounted) return;
+    setState(() {
+      _calibrating = false;
+      _calibrationUploading = false;
+      _calibFrames = [];
+    });
+  }
+
+  Future<void> _finishCalibration() async {
+    if (!_calibrating || _calibrationUploading) return;
+    _calibTicker?.cancel();
+    final epoch = _modeEpoch;
+    final frames = List<_V4Frame>.of(_calibFrames);
+    setState(() => _calibrationUploading = true);
+
+    String message;
+    try {
+      if (frames.length < 10) {
+        message = 'เห็นใบหน้าไม่พอ — หันหน้าเข้ากล้อง แสงพอ แล้วลองใหม่';
+      } else {
+        final jpegs = await _encodeJpegs(frames, _v4.jpegQuality);
+        final result = await LipReadingApiService.calibrateV4(
+            jpegs, _relativeTimestamps(frames));
+        debugPrint('🎯 v4 calibrate: HTTP ${result.statusCode} '
+            '${result.framesWithFace}/${frames.length} faces '
+            '${result.warning ?? result.detail ?? ''}');
+        final calibration = result.calibration;
+        if (calibration != null) {
+          await _saveCalibration(calibration);
+          message = result.warning ?? 'ปรับเทียบเสร็จแล้ว';
+        } else if (result.statusCode == 422) {
+          message = 'เห็นใบหน้าไม่พอ — หันหน้าเข้ากล้อง แสงพอ แล้วลองใหม่';
+        } else {
+          message = 'ปรับเทียบไม่สำเร็จ (ต่อ server ไม่ได้) ลองใหม่อีกครั้ง';
+        }
+      }
+    } catch (e) {
+      debugPrint('❌ v4 calibration error: $e');
+      message = 'ปรับเทียบไม่สำเร็จ ลองใหม่อีกครั้ง';
+    }
+
+    if (!mounted || epoch != _modeEpoch) return;
+    _cancelCalibration();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message),
+      behavior: SnackBarBehavior.floating,
+      duration: const Duration(seconds: 3),
+    ));
+  }
+
+  Future<void> _promptCalibration() async {
+    if (!mounted || !_usesV4 || _calibrating) return;
+    final start = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('ปรับเทียบใบหน้า'),
+        content: Text(
+          'ใช้เวลาประมาณ ${_v4.calibrationSeconds.round()} วินาที '
+          'ทำครั้งเดียวแล้วใช้ได้ตลอด ช่วยให้อ่านปากแม่นขึ้นมาก\n\n'
+          'ถือมือถือระยะเซลฟี่ หน้าตรง แล้วอ่านข้อความบนจอช้าๆ',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('ข้ามไปก่อน'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('เริ่มเลย'),
+          ),
+        ],
+      ),
+    );
+    if (start == true) _startCalibration();
+  }
+
+  /// ใส่คำที่ v4 ทายได้ลงจอเองทันที ไม่ต้องให้ผู้ใช้เลือก (ตัวเลือกอื่นเก็บไว้
+  /// เผื่อผู้ใช้อยากแตะแก้ทีหลัง)
+  ///
+  /// - โหมด "คำ": คำใหม่แทนที่คำเดิม แล้วอ่านออกเสียงทันที (คำเดียวคือจบแล้ว)
+  /// - โหมด "ต่อคำ": ต่อท้ายประโยค แล้วรอให้หยุดพูดสักพักค่อยอ่านทั้งประโยค
+  ///
+  /// คำที่ต่ำกว่าเกณฑ์ความมั่นใจก็ใส่ด้วย แต่แสดงสีจาง — คำที่ถูกหลายคำได้
+  /// ความมั่นใจแค่ 4-10% ถ้าทิ้งตามเกณฑ์ จะเสียคำที่ถูกไปมาก
+  void _appendChainWord(WordPrediction? result, {required bool idleOnly}) {
+    if (idleOnly) {
+      setState(() => _words = []);
+      _scheduleSentenceEnd();
+      return;
+    }
+    if (result == null || result.topK.isEmpty) {
+      setState(() => _words = [_unreadableMessage]);
+      _scheduleSentenceEnd();
+      return;
+    }
+
+    final slot = _WordSlot(result.topK, uncertain: result.lowConfidence);
+    if (!_isChainMode) {
+      setState(() {
+        _chain = [slot];
+        _focusedSlot = null;
+        _words = [];
+      });
+      _speakText(slot.word);
+      return;
+    }
+
+    setState(() {
+      // ประโยคก่อนหน้าอ่านออกเสียงไปแล้ว (หรือยาวเต็มแล้ว) — คำนี้เริ่มประโยคใหม่
+      if (_sentenceSpoken || _chain.length >= _chainMaxWords) {
+        _chain = [];
+        _sentenceSpoken = false;
+      }
+      _chain = [..._chain, slot];
+      _focusedSlot = null;
+      _words = [];
+    });
+    _scheduleSentenceEnd();
+  }
+
+  /// หยุดพูดนานเท่านี้หลังคำล่าสุด ถือว่าจบประโยค แล้วอ่านออกเสียงทั้งประโยค
+  static const Duration _sentenceEndPause = Duration(milliseconds: 2500);
+  Timer? _sentenceEndTimer;
+  bool _sentenceSpoken = false;
+
+  void _scheduleSentenceEnd() {
+    if (!_isChainMode) return;
+    _sentenceEndTimer?.cancel();
+    final epoch = _modeEpoch;
+    _sentenceEndTimer = Timer(_sentenceEndPause, () {
+      if (!mounted || epoch != _modeEpoch) return;
+      if (_chain.isEmpty || _sentenceSpoken) return;
+      if (_state == _SpeakingState.speaking) return;
+      setState(() => _sentenceSpoken = true);
+      _speakText(_chainText);
+    });
+  }
+
+  Future<void> _speakText(String text) async {
+    if (text.isEmpty) return;
+    setState(() => _isTtsSpeaking = true);
+    _tts.setOnCompletionHandler(() {
+      if (mounted) setState(() => _isTtsSpeaking = false);
+    });
+    await _tts.speak(text, emotion: _currentEmotion);
+  }
+
   void _selectCandidate(int slotIndex, int candidateIndex) {
+    final word = _chain[slotIndex].candidates[candidateIndex].word;
     setState(() {
       _chain[slotIndex]
         ..selected = candidateIndex
         ..uncertain = false;
+      _focusedSlot = null;
     });
+    // โหมด "คำ" อ่านคำที่แก้แล้วให้ฟังเลย ส่วน "ต่อคำ" ถ้าประโยคอ่านไปแล้ว
+    // ให้กด Voice อ่านประโยคที่แก้แล้วเอง
+    if (!_isChainMode) _speakText(word);
   }
 
   void _removeLastChainWord() {
@@ -1518,6 +1738,8 @@ class _ScannerScreenState extends State<ScannerScreen>
     _wordTimer?.cancel();
     _silenceTimer?.cancel();
     _utteranceWatchdogTimer?.cancel();
+    _calibTicker?.cancel();
+    _sentenceEndTimer?.cancel();
     _apiStatusTimer?.cancel();
     _overlayData.dispose();
     _pulseCtrl.dispose();
@@ -1791,7 +2013,9 @@ class _ScannerScreenState extends State<ScannerScreen>
           ),
         ],
       ),
-      child: _isChainMode ? _buildChainContent() : Column(
+      child: _usesV4
+          ? (_calibrating ? _buildCalibrationContent() : _buildChainContent())
+          : Column(
         children: [
           if (_isSentenceMode)
             const Padding(
@@ -1836,15 +2060,52 @@ class _ScannerScreenState extends State<ScannerScreen>
   Widget _buildChainContent() {
     // คำที่กำลังพูดอยู่/ข้อความสถานะ ยังไม่ใช่ส่วนของประโยค
     final pending = _words.join(' ');
-    final focus =
-        _chain.isEmpty ? null : (_focusedSlot ?? _chain.length - 1);
+    // ตัวเลือกซ่อนไว้ ขึ้นเฉพาะคำที่ผู้ใช้แตะเพื่อแก้
+    final focus = (_focusedSlot != null && _focusedSlot! < _chain.length)
+        ? _focusedSlot
+        : null;
     const hint = TextStyle(fontSize: 14, color: AppTheme.textHint);
+    final needsCalibration = _v4NeedsCalibration;
 
     return Column(
       children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              needsCalibration
+                  ? Icons.info_outline_rounded
+                  : Icons.check_circle_rounded,
+              size: 14,
+              color: needsCalibration ? AppTheme.warning : AppTheme.successDark,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              needsCalibration ? 'ยังไม่ได้ปรับเทียบ' : 'ปรับเทียบแล้ว',
+              style: const TextStyle(fontSize: 11, color: AppTheme.textSecondary),
+            ),
+            TextButton(
+              onPressed: _isApiAvailable ? _startCalibration : null,
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                minimumSize: const Size(0, 32),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              child: Text(
+                needsCalibration ? 'ปรับเทียบ' : 'ปรับเทียบใหม่',
+                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
         if (_chain.isEmpty && pending.isEmpty)
-          const Text('พูดทีละคำ เว้นจังหวะระหว่างคำ...',
-              style: hint, textAlign: TextAlign.center)
+          Text(
+              _isChainMode
+                  ? 'พูดทีละคำ เว้นจังหวะระหว่างคำ...'
+                  : 'พูดคำที่ต้องการ...',
+              style: hint,
+              textAlign: TextAlign.center)
         else
           Wrap(
             alignment: WrapAlignment.center,
@@ -1859,13 +2120,29 @@ class _ScannerScreenState extends State<ScannerScreen>
                   pending + (_state == _SpeakingState.speaking ? '...' : ''),
                   style: hint,
                 ),
+              if (_isChainMode && _chain.isNotEmpty)
+                GestureDetector(
+                  onTap: _removeLastChainWord,
+                  child: Container(
+                    padding: const EdgeInsets.all(7),
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(color: AppTheme.divider),
+                    ),
+                    child: const Icon(Icons.backspace_outlined,
+                        size: 16, color: AppTheme.textSecondary),
+                  ),
+                ),
             ],
           ),
+        if (focus == null && _chain.isNotEmpty)
+          const Padding(
+            padding: EdgeInsets.only(top: 6),
+            child: Text('แตะคำเพื่อแก้',
+                style: TextStyle(fontSize: 11, color: AppTheme.textHint)),
+          ),
         if (focus != null) ...[
-          const SizedBox(height: 14),
-          Text('ตัวเลือกของคำที่ ${focus + 1}',
-              style: const TextStyle(fontSize: 11, color: AppTheme.textHint)),
-          const SizedBox(height: 6),
+          const SizedBox(height: 12),
           Wrap(
             alignment: WrapAlignment.center,
             crossAxisAlignment: WrapCrossAlignment.center,
@@ -1874,18 +2151,6 @@ class _ScannerScreenState extends State<ScannerScreen>
             children: [
               for (var j = 0; j < _chain[focus].candidates.length; j++)
                 _buildCandidateChip(focus, j),
-              GestureDetector(
-                onTap: _removeLastChainWord,
-                child: Container(
-                  padding: const EdgeInsets.all(9),
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(color: AppTheme.divider),
-                  ),
-                  child: const Icon(Icons.backspace_outlined,
-                      size: 18, color: AppTheme.textSecondary),
-                ),
-              ),
             ],
           ),
         ],
@@ -1893,10 +2158,65 @@ class _ScannerScreenState extends State<ScannerScreen>
     );
   }
 
+  Widget _buildCalibrationContent() {
+    final totalMs = _v4.calibrationSeconds * 1000;
+    final elapsedMs = _calibElapsed.inMilliseconds.toDouble();
+    final progress = (elapsedMs / totalMs).clamp(0.0, 1.0);
+    final secondsLeft = ((totalMs - elapsedMs) / 1000).ceil().clamp(0, 999);
+
+    return Column(
+      children: [
+        const Text(
+          'ปรับเทียบใบหน้า',
+          style: TextStyle(
+            fontSize: 15,
+            fontWeight: FontWeight.w700,
+            color: AppTheme.textPrimary,
+          ),
+        ),
+        const SizedBox(height: 4),
+        const Text(
+          'หน้าตรง ระยะเซลฟี่ อ่านข้อความนี้ช้าๆ (ไม่ออกเสียงก็ได้)',
+          style: TextStyle(fontSize: 12, color: AppTheme.textSecondary),
+          textAlign: TextAlign.center,
+        ),
+        const SizedBox(height: 12),
+        const Text(
+          _calibrationScript,
+          style: TextStyle(fontSize: 16, height: 1.5, color: AppTheme.textPrimary),
+          textAlign: TextAlign.center,
+        ),
+        const SizedBox(height: 14),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: LinearProgressIndicator(
+            value: _calibrationUploading ? null : progress,
+            minHeight: 6,
+            backgroundColor: AppTheme.inputBg,
+            color: AppTheme.successDark,
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          _calibrationUploading
+              ? 'กำลังคำนวณ...'
+              : 'เหลืออีก $secondsLeft วินาที · เห็นหน้า ${_calibFrames.length} ภาพ',
+          style: const TextStyle(fontSize: 12, color: AppTheme.textHint),
+        ),
+        if (!_calibrationUploading)
+          TextButton(
+            onPressed: _cancelCalibration,
+            child: const Text('ยกเลิก'),
+          ),
+      ],
+    );
+  }
+
   Widget _buildChainChip(int index, {required bool focused}) {
     final slot = _chain[index];
     return GestureDetector(
-      onTap: () => setState(() => _focusedSlot = index),
+      onTap: () => setState(
+          () => _focusedSlot = _focusedSlot == index ? null : index),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 150),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -2353,6 +2673,15 @@ enum _SpeakingState { idle, speaking, paused, finalizing }
 /// chain = โมเดล 44 คำ แต่ต่อคำเป็นประโยค และให้เลือกจาก 3 ตัวเลือกได้
 /// sentence = โมเดลประโยค CTC (ทดลอง)
 enum _ReadMode { word, chain, sentence }
+
+/// ภาพหน้าหนึ่งเฟรมสำหรับ v4: พิกเซล RGB ตั้งตรง ยังไม่เข้ารหัส + เวลาที่ถ่าย
+/// (เข้ารหัส JPEG ทีเดียวตอนส่ง เพราะเฟรมย้อนหลังส่วนใหญ่ถูกทิ้งไม่ได้ใช้)
+class _V4Frame {
+  final Uint8List rgb;
+  final int size;
+  final int tMs;
+  const _V4Frame(this.rgb, this.size, this.tMs);
+}
 
 /// หนึ่งคำในประโยคของโหมดต่อคำ พร้อมตัวเลือกที่โมเดลทายมา
 class _WordSlot {

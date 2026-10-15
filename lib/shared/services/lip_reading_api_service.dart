@@ -31,62 +31,6 @@ class LipReadingApiService {
     }
   }
 
-  /// ส่งภาพปากไปให้โมเดล VocaLip ทำนายว่าเป็นคำใดใน 44 คำ
-  ///
-  /// [frames] ภาพปากสี PNG ขนาด 112x112 เรียงตามเวลา ส่งมากี่เฟรมก็ได้ —
-  /// server จะเลือก/เติมให้เหลือ 16 เฟรมตามที่โมเดลรับเอง
-  ///
-  /// โมเดลนี้คืน "คำเดียว" ต่อหนึ่งคลิป ไม่ใช่ข้อความอิสระ และบังคับเลือก 1 ใน
-  /// 44 คำเสมอแม้ผู้ใช้พูดคำนอกชุด จึงควรดู [WordPrediction.lowConfidence] ด้วย
-  static Future<WordPrediction?> predictWord(
-    List<Uint8List> frames, {
-    required int roiSize,
-    int topK = 3,
-    int? captureMs,
-    int? collectedFrames,
-    bool? isFinal,
-  }) async {
-    if (frames.isEmpty) return null;
-
-    try {
-      final response = await http
-          .post(
-            Uri.parse('$_baseUrl/predict_word'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'frames': frames.map(base64Encode).toList(),
-              'top_k': topK,
-              // พิกเซลดิบ RGB เรียงแถวละ roi*3 ไบต์ ไม่ใช่ไฟล์ภาพ — เลี่ยงการ
-              // เข้ารหัส PNG แล้วให้ server ถอดกลับเป็นพิกเซลชุดเดิม ซึ่งหนัก
-              // พอที่จะทำให้ UI thread ค้างจนตรวจใบหน้าไม่ทัน
-              'frame_format': 'rgb',
-              'roi': roiSize,
-              if (captureMs != null) 'capture_ms': captureMs,
-              // จำนวนเฟรมที่เก็บได้จริง ต่างจาก frames.length ที่ถูกลดเหลือ
-              // เท่าที่โมเดลรับแล้ว — ต้องใช้ตัวนี้คำนวณอัตราเฟรมต่อวินาที
-              if (collectedFrames != null) 'collected_frames': collectedFrames,
-              if (isFinal != null) 'is_final': isFinal,
-            }),
-          )
-          .timeout(_timeout);
-
-      if (response.statusCode != 200) {
-        debugPrint('❌ predict_word ${response.statusCode}: ${response.body}');
-        return null;
-      }
-
-      // ต้อง decode เป็น UTF-8 เอง — FastAPI ไม่ได้ใส่ charset มาใน
-      // Content-Type และ package:http จะ fallback ไปเป็น latin1 ทำให้คำไทย
-      // กลายเป็นตัวอักษรขยะโดยไม่มี error ฟ้อง
-      final data =
-          jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
-      return WordPrediction.fromJson(data);
-    } catch (e) {
-      debugPrint('❌ predict_word failed: $e');
-      return null;
-    }
-  }
-
   /// โหมดทดลอง: อ่านปากเป็นข้อความอิสระด้วยโมเดลประโยค (CTC ระดับตัวอักษร)
   ///
   /// ส่ง "ทุกเฟรม" ที่เก็บได้ ไม่ต้องลดจำนวน และต้องส่ง [captureMs] มาเสมอ
@@ -127,28 +71,117 @@ class LipReadingApiService {
     }
   }
 
-  /// ถามค่า preprocessing ที่โมเดลบน server ต้องการจริงๆ
-  ///
-  /// ค่าพวกนี้ต้องตรงกับตอนเทรนเป๊ะ และเปลี่ยนได้ทุกครั้งที่เปลี่ยนไฟล์โมเดล
-  /// ถ้าฝั่งแอปฝังค่าไว้ตายตัว วันที่โมเดลรุ่นใหม่ใช้ค่าอื่น แอปจะส่งของผิด
-  /// ขนาดไปให้ server ย่อให้เงียบๆ แล้วทำนายมั่วโดยไม่มี error ฟ้อง
-  ///
-  /// คืน null เมื่อถามไม่ได้ ให้ผู้เรียกใช้ค่าสำรองของตัวเองต่อไป
-  static Future<WordModelConfig?> fetchWordModelConfig() async {
+  // ─── VocaLip v4 (200 คำ) ───────────────────────────────────────────────────
+  //
+  // v4 อ่านจากจุดบนใบหน้าที่ server หาเองด้วย MediaPipe จึงรับ "ภาพทั้งหน้า"
+  // (JPEG) ไม่ใช่ภาพปาก และต้องได้เวลาของแต่ละเฟรม server ยืดเป็น 25 fps เอง
+
+  /// ค่าที่โมเดล v4 ต้องการ (fps, ความยาวคลิป, วิธีครอป) — คืน null ถ้าถามไม่ได้
+  static Future<V4ModelInfo?> fetchV4ModelInfo() async {
     try {
       final response = await http
-          .get(Uri.parse('$_baseUrl/word_model_info'))
+          .get(Uri.parse('$_baseUrl/v4/model_info'))
           .timeout(_timeout);
       if (response.statusCode != 200) return null;
-
-      final data =
-          jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
-      return WordModelConfig.fromJson(data);
+      return V4ModelInfo.fromJson(
+          jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>);
     } catch (e) {
-      debugPrint('word_model_info failed: $e');
+      debugPrint('v4/model_info failed: $e');
       return null;
     }
   }
+
+  /// ส่งภาพหน้าช่วงปรับเทียบ (~20 วินาที) ได้ค่าประจำตัวผู้ใช้กลับมาเก็บในเครื่อง
+  static Future<V4CalibrateResult> calibrateV4(
+    List<Uint8List> jpegFrames,
+    List<double> timestampsMs,
+  ) async {
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$_baseUrl/v4/calibrate'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'frames': jpegFrames.map(base64Encode).toList(),
+              'timestamps_ms': timestampsMs,
+              'frame_format': 'jpeg',
+            }),
+          )
+          .timeout(_timeout);
+      final data = _decodeBody(response);
+      if (response.statusCode != 200) {
+        return V4CalibrateResult.failed(response.statusCode, data['detail']?.toString());
+      }
+      return V4CalibrateResult(
+        statusCode: 200,
+        calibration: V4Calibration(
+          featMean: _doubles(data['feat_mean']),
+          featStd: _doubles(data['feat_std']),
+          modelVersion: data['model_version'] as String? ?? '',
+        ),
+        framesWithFace: (data['frames_with_face'] as num?)?.toInt() ?? 0,
+        warning: data['warning'] as String?,
+      );
+    } catch (e) {
+      debugPrint('❌ v4/calibrate failed: $e');
+      return V4CalibrateResult.failed(0, '$e');
+    }
+  }
+
+  /// ทายคำจากภาพหน้าหนึ่งช่วง — ผลมีรูปแบบเดียวกับ [predictWord] เดิม
+  ///
+  /// ไม่ส่ง [calibration] = server ใช้ค่ากลาง ซึ่งแม่นน้อยกว่ามาก
+  static Future<V4PredictResult> predictWordV4(
+    List<Uint8List> jpegFrames,
+    List<double> timestampsMs, {
+    V4Calibration? calibration,
+    int topK = 5,
+  }) async {
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$_baseUrl/v4/predict_word'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'frames': jpegFrames.map(base64Encode).toList(),
+              'timestamps_ms': timestampsMs,
+              'frame_format': 'jpeg',
+              'top_k': topK,
+              if (calibration != null) 'feat_mean': calibration.featMean,
+              if (calibration != null) 'feat_std': calibration.featStd,
+            }),
+          )
+          .timeout(_timeout);
+      final data = _decodeBody(response);
+      if (response.statusCode != 200) {
+        return V4PredictResult(
+            statusCode: response.statusCode, detail: data['detail']?.toString());
+      }
+      return V4PredictResult(
+        statusCode: 200,
+        prediction: WordPrediction.fromJson(data),
+        faceRatio: (data['face_ratio'] as num?)?.toDouble(),
+        captureFps: (data['capture_fps'] as num?)?.toDouble(),
+        calibrated: data['calibrated'] as bool? ?? false,
+        modelVersion: data['model_version'] as String?,
+      );
+    } catch (e) {
+      debugPrint('❌ v4/predict_word failed: $e');
+      return V4PredictResult(statusCode: 0, detail: '$e');
+    }
+  }
+
+  static Map<String, dynamic> _decodeBody(http.Response response) {
+    try {
+      final data = jsonDecode(utf8.decode(response.bodyBytes));
+      return data is Map<String, dynamic> ? data : <String, dynamic>{};
+    } catch (_) {
+      return <String, dynamic>{};
+    }
+  }
+
+  static List<double> _doubles(dynamic list) =>
+      (list as List? ?? const []).map((e) => (e as num).toDouble()).toList();
 
   /// ดูรายชื่อโมเดลที่มีบน Server
   static Future<Map<String, dynamic>?> getModels() async {
@@ -167,48 +200,122 @@ class LipReadingApiService {
   }
 }
 
-/// ค่า preprocessing ที่โมเดลบน server ต้องการ อ่านจากไฟล์ checkpoint โดยตรง
-class WordModelConfig {
-  /// จำนวนเฟรมต่อหนึ่งคลิป
-  final int frames;
+/// ค่าที่โมเดล v4 ต้องการ อ่านจาก /v4/model_info (ห้ามฝังไว้ในแอป เพราะรุ่น
+/// โมเดลถัดไปเปลี่ยนได้ทั้งรายการคำและความยาวคลิป)
+class V4ModelInfo {
+  final String version;
+  final double fps;
+  final int minFrames;
+  final int maxFrames;
+  final double calibrationSeconds;
+  final int cropSize;
+  final double boxScale;
+  final int jpegQuality;
 
-  /// ความกว้าง/สูงของภาพปากที่โมเดลรับ (จัตุรัส)
-  final int roi;
-
-  /// อัตราขยายกรอบครอบปาก — ปกติ checkpoint ยังไม่ได้บอกค่านี้มา
-  /// จะมีค่าก็ต่อเมื่อผู้เทรนใส่ `mouth_scale` ลงใน preprocessing ให้
-  final double? mouthScale;
-
-  const WordModelConfig({
-    required this.frames,
-    required this.roi,
-    this.mouthScale,
+  const V4ModelInfo({
+    required this.version,
+    required this.fps,
+    required this.minFrames,
+    required this.maxFrames,
+    required this.calibrationSeconds,
+    required this.cropSize,
+    required this.boxScale,
+    required this.jpegQuality,
   });
 
-  /// คืน null ถ้าค่าที่ได้มาอยู่นอกช่วงที่สมเหตุสมผล ดีกว่ารับค่าพังมาใช้
-  /// แล้วทำให้แอปส่งภาพขนาดประหลาดไปทั้ง session
-  static WordModelConfig? fromJson(Map<String, dynamic> json) {
-    final frames = (json['frames'] as num?)?.toInt();
-    final roi = (json['roi'] as num?)?.toInt();
-    if (frames == null || roi == null) return null;
-    if (frames < 2 || frames > 64) return null;
-    if (roi < 32 || roi > 512) return null;
+  double get maxSeconds => maxFrames / fps;
 
-    final pre = json['preprocessing'];
-    final scale = pre is Map<String, dynamic>
-        ? (pre['mouth_scale'] as num?)?.toDouble()
-        : null;
-
-    return WordModelConfig(
-      frames: frames,
-      roi: roi,
-      mouthScale: (scale != null && scale >= 1.0 && scale <= 6.0) ? scale : null,
+  factory V4ModelInfo.fromJson(Map<String, dynamic> json) {
+    final crop = json['recommended_face_crop'] as Map<String, dynamic>? ?? {};
+    return V4ModelInfo(
+      version: json['version'] as String? ?? '',
+      fps: (json['fps'] as num?)?.toDouble() ?? 25.0,
+      minFrames: (json['min_frames'] as num?)?.toInt() ?? 4,
+      maxFrames: (json['max_frames'] as num?)?.toInt() ?? 40,
+      calibrationSeconds:
+          (json['calibration_seconds'] as num?)?.toDouble() ?? 20.0,
+      cropSize: (crop['size'] as num?)?.toInt() ?? 192,
+      boxScale: (crop['box_scale'] as num?)?.toDouble() ?? 1.4,
+      jpegQuality: (crop['quality'] as num?)?.toInt() ?? 80,
     );
   }
 
   @override
-  String toString() => 'frames=$frames roi=$roi'
-      '${mouthScale != null ? ' mouthScale=$mouthScale' : ''}';
+  String toString() => '$version fps=$fps frames=$minFrames-$maxFrames '
+      'crop=$cropSize x$boxScale q$jpegQuality';
+}
+
+/// ค่าปรับเทียบของผู้ใช้หนึ่งคน (110 + 110 ตัวเลข) เก็บในเครื่อง ไม่เก็บบน server
+class V4Calibration {
+  final List<double> featMean;
+  final List<double> featStd;
+
+  /// รุ่นโมเดลตอนปรับเทียบ — ถ้า server เปลี่ยนรุ่น ควรปรับเทียบใหม่
+  final String modelVersion;
+
+  const V4Calibration({
+    required this.featMean,
+    required this.featStd,
+    required this.modelVersion,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'feat_mean': featMean,
+        'feat_std': featStd,
+        'model_version': modelVersion,
+      };
+
+  static V4Calibration? fromJson(Map<String, dynamic> json) {
+    final mean = json['feat_mean'];
+    final std = json['feat_std'];
+    if (mean is! List || std is! List || mean.isEmpty) return null;
+    return V4Calibration(
+      featMean: mean.map((e) => (e as num).toDouble()).toList(),
+      featStd: std.map((e) => (e as num).toDouble()).toList(),
+      modelVersion: json['model_version'] as String? ?? '',
+    );
+  }
+}
+
+class V4CalibrateResult {
+  final int statusCode;
+  final V4Calibration? calibration;
+  final int framesWithFace;
+  final String? warning;
+  final String? detail;
+
+  const V4CalibrateResult({
+    required this.statusCode,
+    this.calibration,
+    this.framesWithFace = 0,
+    this.warning,
+    this.detail,
+  });
+
+  factory V4CalibrateResult.failed(int statusCode, String? detail) =>
+      V4CalibrateResult(statusCode: statusCode, detail: detail);
+}
+
+class V4PredictResult {
+  /// 200 = สำเร็จ, 422 = ไม่เจอใบหน้า, 400 = ค่าปรับเทียบใช้กับรุ่นนี้ไม่ได้,
+  /// 0 = ต่อ server ไม่ได้
+  final int statusCode;
+  final WordPrediction? prediction;
+  final String? detail;
+  final double? faceRatio;
+  final double? captureFps;
+  final bool calibrated;
+  final String? modelVersion;
+
+  const V4PredictResult({
+    required this.statusCode,
+    this.prediction,
+    this.detail,
+    this.faceRatio,
+    this.captureFps,
+    this.calibrated = false,
+    this.modelVersion,
+  });
 }
 
 /// ผลจากโมเดลประโยค (ทดลอง) — ไม่มีค่าความมั่นใจ จึงกรองผลมั่วไม่ได้
