@@ -43,11 +43,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 from PIL import Image
 
-from lip_model import (
-    load_model_1, load_model_2,
-    ctc_greedy_decode, LipReadingModel, DualStreamModel,
-    load_vocalip_word_model, load_vocalip_real_model,
-)
+from lip_model import load_vocalip_word_model, load_vocalip_real_model
+from vocalip_ctc import load_vocalip_ctc, resample_to_fps, predict_text
+from vocalip_v4 import router as v4_router, preload as v4_preload
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
 
@@ -64,6 +62,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(v4_router)
 
 # ─── Load Models on Startup ──────────────────────────────────────────────────
 
@@ -101,32 +100,7 @@ async def load_models():
     """โหลดโมเดลทั้งหมดตอน server เริ่มต้น"""
     global models
 
-    # Model 1: lip frames only
-    model1_path = os.path.join(MODEL_DIR, "best_model_1_9_26.pt")
-    if os.path.exists(model1_path):
-        try:
-            model, itos, config = load_model_1(model1_path)
-            models["model1"] = {"model": model, "itos": itos, "config": config, "type": "lip_only"}
-            print(f"✅ Model 1 loaded: {model1_path} (lip frames, image_size={config.get('image_size', 96)})")
-        except Exception as e:
-            print(f"❌ Failed to load Model 1: {e}")
-    else:
-        print(f"⚠️ Model 1 not found: {model1_path}")
-
-    # Model 2: face + mouth
-    model2_path = os.path.join(MODEL_DIR, "best_model_2_9_26.pt")
-    if os.path.exists(model2_path):
-        try:
-            model, itos, config = load_model_2(model2_path)
-            models["model2"] = {"model": model, "itos": itos, "config": config, "type": "dual_stream"}
-            print(f"✅ Model 2 loaded: {model2_path} (face+mouth, face={config.get('face_size', 112)}, mouth={config.get('mouth_size', 96)})")
-        except Exception as e:
-            print(f"❌ Failed to load Model 2: {e}")
-    else:
-        print(f"⚠️ Model 2 not found: {model2_path}")
-
-    # VocaLip Thai: ทำนายเป็น "คำ" จาก 44 คำที่เทรนไว้ (คนละตระกูลกับสองตัวบน
-    # ซึ่งเป็น CTC ระดับตัวอักษร) จึงแยก endpoint และแยก preprocessing กันคนละชุด
+    # VocaLip Thai: ทำนายเป็น "คำ" จาก 44 คำที่เทรนไว้
     #
     # รองรับสอง checkpoint ที่ฟอร์แมตต่างกัน เรียงจากใหม่ไปเก่า ตัวแรกที่เจอชนะ
     # รุ่น 05 บอกค่า deployment มาครบกว่ามาก (ลำดับช่องสี, เกณฑ์ปฏิเสธ,
@@ -199,27 +173,33 @@ async def load_models():
         else:
             print("   ไม่มีไฟล์ที่ลงท้ายด้วย _deployment.pt เลย")
 
+    # โมเดลประโยค (ทดลอง) — ไม่มีก็ไม่เป็นไร server ยังให้บริการโมเดลอื่นต่อ
+    ctc_dir = os.path.join(MODEL_DIR, "vocalip_th_ctc")
+    if os.path.isdir(ctc_dir):
+        try:
+            encoder, ctc, id_to_char, meta = load_vocalip_ctc(ctc_dir)
+            models["vocalip_sentence"] = {
+                "encoder": encoder, "ctc": ctc, "id_to_char": id_to_char,
+                "meta": meta, "type": "sentence_ctc",
+            }
+            print(
+                f"✅ VocaLip sentence model loaded (EXPERIMENTAL): {meta['format']} "
+                f"({meta['vocab_size']} chars, {meta['target_fps']:g} fps, "
+                f"roi={meta['roi']}, {meta['color_order']}, "
+                f"blank offset={meta['blank_logit_offset']})"
+            )
+            print(f"   ⚠️ validation CER={meta['validation_cer']:.1%} "
+                  f"on {meta['validation_samples']} samples")
+        except Exception as e:
+            print(f"❌ Failed to load sentence model from {ctc_dir}: {e}")
+
+    v4_preload()
+
     if not models:
         print("⚠️ No models loaded! Place .pt files in server/models/")
 
 
 # ─── Request/Response Models ─────────────────────────────────────────────────
-
-class PredictRequest(BaseModel):
-    """Request body สำหรับ prediction"""
-    frames: List[str]  # List of base64-encoded grayscale lip frame images
-    face_frames: Optional[List[str]] = None  # For dual-stream model (optional)
-    model: Optional[str] = "model1"  # "model1" or "model2"
-
-
-class PredictResponse(BaseModel):
-    """Response body สำหรับ prediction"""
-    text: str
-    confidence: float
-    model_used: str
-    processing_time_ms: float
-    num_frames: int
-
 
 class WordPredictRequest(BaseModel):
     """Request body สำหรับโมเดลทำนายคำ (VocaLip 44 คำ)
@@ -279,26 +259,34 @@ class WordPredictResponse(BaseModel):
     debug: Optional[dict] = None
 
 
-# ─── Helper Functions ─────────────────────────────────────────────────────────
+class SentencePredictRequest(BaseModel):
+    """Request body สำหรับโมเดลประโยค (ทดลอง)
 
-def decode_base64_frame(b64_string: str, target_size: tuple) -> np.ndarray:
-    """แปลง base64 string กลับเป็นภาพ grayscale แล้ว resize"""
-    img_bytes = base64.b64decode(b64_string)
-    img_array = np.frombuffer(img_bytes, dtype=np.uint8)
-    img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+    frames: พิกเซลดิบ RGB base64 เรียงตามเวลา ส่งทุกเฟรมที่เก็บได้ ไม่ต้องลด
+    capture_ms: จำเป็นมาก — ใช้ยืดเฟรมให้เป็น 25 fps ตามตอนเทรน
+    """
+    frames: List[str]
+    capture_ms: Optional[int] = None
+    roi: Optional[int] = None
+    frame_format: Optional[str] = "rgb"
+    debug: Optional[bool] = None
 
-    if img is None:
-        # Try loading with PIL as fallback
-        pil_img = Image.open(io.BytesIO(img_bytes)).convert('L')
-        img = np.array(pil_img)
 
-    # Resize to target size
-    img = cv2.resize(img, target_size)
-
-    # Normalize to 0-1
-    img = img.astype(np.float32) / 255.0
-
-    return img
+class SentencePredictResponse(BaseModel):
+    text: str
+    token_count: int
+    # สัดส่วนเฟรมที่โมเดลตอบว่า "ไม่มีตัวอักษร" สูงมากแปลว่าแทบไม่ได้อะไรเลย
+    blank_rate: float
+    num_frames_received: int
+    # จำนวนเฟรมหลังยืดให้เป็น target_fps แล้ว (คือความยาวที่โมเดลเห็นจริง)
+    num_frames_used: int
+    capture_fps: Optional[float] = None
+    target_fps: float
+    processing_time_ms: float
+    # โมเดลนี้ไม่มีค่าความมั่นใจต่อผลลัพธ์ ต่างจากโมเดลคำ จึงกรองผลมั่วไม่ได้
+    experimental: bool = True
+    validation_cer: Optional[float] = None
+    debug: Optional[dict] = None
 
 
 # ─── API Endpoints ────────────────────────────────────────────────────────────
@@ -313,16 +301,19 @@ async def root():
 
 
 def _model_summary(info: dict) -> dict:
-    """สรุปข้อมูลโมเดลแบบรองรับทั้งตระกูล CTC (itos) และตระกูลทำนายคำ
-
-    สองตระกูลเก็บ metadata คนละคีย์กัน จึงต้องแยกอ่าน ไม่งั้น endpoint
-    ที่วนทุกโมเดลจะพังทันทีที่มีโมเดลตระกูลใหม่โผล่มา
-    """
-    if "itos" in info:
+    """สรุปข้อมูลโมเดล — โมเดลคำกับโมเดลประโยคเก็บ metadata คนละคีย์กัน"""
+    if info["type"] == "sentence_ctc":
+        meta = info["meta"]
         return {
             "type": info["type"],
-            "config": info.get("config", {}),
-            "vocab_size": len(info["itos"]),
+            "format": meta["format"],
+            "experimental": True,
+            "target_fps": meta["target_fps"],
+            "roi": meta["roi"],
+            "mouth_scale": meta["mouth_scale"],
+            "color_order": meta["color_order"],
+            "vocab_size": meta["vocab_size"],
+            "validation_cer": meta["validation_cer"],
         }
 
     meta = info.get("meta", {})
@@ -356,97 +347,6 @@ async def list_models():
     return {name: _model_summary(info) for name, info in models.items()}
 
 
-@app.post("/predict", response_model=PredictResponse)
-async def predict(request: PredictRequest):
-    """
-    รับ lip frames (base64) แล้วรัน prediction
-
-    - model1: ส่งแค่ frames (lip images 96x96)
-    - model2: ส่ง frames (mouth 96x96) + face_frames (face 112x112)
-    """
-    start_time = time.time()
-
-    # Validate model selection
-    model_key = request.model or "model1"
-    if model_key not in models:
-        available = list(models.keys())
-        if not available:
-            raise HTTPException(status_code=503, detail="ไม่มีโมเดลโหลดอยู่ กรุณาตรวจสอบไฟล์ .pt")
-        model_key = available[0]  # Fallback to first available
-
-    model_info = models[model_key]
-    model = model_info["model"]
-    itos = model_info["itos"]
-    config = model_info["config"]
-
-    # Validate frames
-    if not request.frames or len(request.frames) == 0:
-        raise HTTPException(status_code=400, detail="ไม่มี frames ส่งมา")
-
-    try:
-        with torch.no_grad():
-            if model_info["type"] == "lip_only":
-                # ─── Model 1: lip frames only ─────────────────────────────
-                img_size = config.get("image_size", 96)
-                frames = []
-                for b64 in request.frames:
-                    frame = decode_base64_frame(b64, (img_size, img_size))
-                    frames.append(frame)
-
-                # Stack: (1, T, H, W)
-                frames_tensor = torch.FloatTensor(np.array(frames)).unsqueeze(0)
-                logits = model(frames_tensor)  # (1, T, vocab_size)
-
-            elif model_info["type"] == "dual_stream":
-                # ─── Model 2: face + mouth ────────────────────────────────
-                mouth_size = config.get("mouth_size", 96)
-                face_size = config.get("face_size", 112)
-
-                mouth_frames = []
-                for b64 in request.frames:
-                    frame = decode_base64_frame(b64, (mouth_size, mouth_size))
-                    mouth_frames.append(frame)
-
-                face_frames = []
-                if request.face_frames:
-                    for b64 in request.face_frames:
-                        frame = decode_base64_frame(b64, (face_size, face_size))
-                        face_frames.append(frame)
-                else:
-                    # Fallback: ใช้ mouth frames resize เป็น face size
-                    for b64 in request.frames:
-                        frame = decode_base64_frame(b64, (face_size, face_size))
-                        face_frames.append(frame)
-
-                mouth_tensor = torch.FloatTensor(np.array(mouth_frames)).unsqueeze(0)
-                face_tensor = torch.FloatTensor(np.array(face_frames)).unsqueeze(0)
-                logits = model(face_tensor, mouth_tensor)  # (1, T, vocab_size)
-
-            else:
-                raise HTTPException(status_code=500, detail=f"Unknown model type: {model_info['type']}")
-
-            # CTC Decode
-            probs = torch.softmax(logits[0], dim=-1)
-            text = ctc_greedy_decode(probs, itos)
-
-            # Confidence: average max probability per timestep
-            max_probs = torch.max(probs, dim=-1).values
-            confidence = float(torch.mean(max_probs).item())
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
-
-    elapsed = (time.time() - start_time) * 1000  # ms
-
-    return PredictResponse(
-        text=text if text else "(ไม่สามารถอ่านได้)",
-        confidence=round(confidence, 4),
-        model_used=model_key,
-        processing_time_ms=round(elapsed, 2),
-        num_frames=len(request.frames),
-    )
-
-
 # ─── VocaLip 44-word prediction ──────────────────────────────────────────────
 
 def _decode_color_frame(b64_string: str, roi: int) -> np.ndarray:
@@ -474,12 +374,15 @@ def _decode_color_frame(b64_string: str, roi: int) -> np.ndarray:
     return np.ascontiguousarray(img)
 
 
-def _decode_raw_rgb_frame(b64_string: str, src_roi: int, roi: int) -> np.ndarray:
+def _decode_raw_rgb_frame(b64_string: str, src_roi: int, roi: int,
+                          to_bgr: bool = True) -> np.ndarray:
     """พิกเซลดิบ RGB -> ภาพ BGR ขนาด roi x roi (uint8, HWC)
 
     client ส่ง RGB มาเพราะเป็นลำดับที่มันคำนวณออกมาตรงๆ จาก YUV ส่วนโมเดล
     ต้องการ BGR (เหมือนที่ cv2.imdecode คืนมาตอนใช้ PNG) จึงกลับช่องที่นี่
     ให้ได้ผลเหมือนกันทุกประการกับทางเดิม
+
+    to_bgr=False สำหรับโมเดลประโยค ซึ่งเทรนด้วย RGB — คนละแบบกับโมเดลคำ
     """
     raw = base64.b64decode(b64_string)
     expected = src_roi * src_roi * 3
@@ -491,7 +394,8 @@ def _decode_raw_rgb_frame(b64_string: str, src_roi: int, roi: int) -> np.ndarray
         )
 
     img = np.frombuffer(raw, dtype=np.uint8).reshape(src_roi, src_roi, 3)
-    img = img[:, :, ::-1]                       # RGB -> BGR
+    if to_bgr:
+        img = img[:, :, ::-1]                   # RGB -> BGR
     if src_roi != roi:
         img = cv2.resize(img, (roi, roi))
     return np.ascontiguousarray(img)
@@ -784,6 +688,75 @@ def _print_word_debug(dbg: dict, candidates: List[WordCandidate]) -> None:
         print(f"{rank}. {c.word}\t{c.confidence:.4f}", flush=True)
     print(f"\nsaved: {dbg['debug_images']['last_roi']}", flush=True)
     print("─" * 52, flush=True)
+
+
+@app.post("/predict_sentence", response_model=SentencePredictResponse)
+async def predict_sentence(request: SentencePredictRequest):
+    """อ่านปากเป็นข้อความอิสระ (CTC ระดับตัวอักษร) — โหมดทดลอง
+
+    ⚠️ ทดสอบแล้วว่าผลแทบไม่ขึ้นกับการขยับปาก (ภาพนิ่งซ้ำได้ผลใกล้เคียงคลิปจริง)
+    เปิดไว้ให้ลองต่อระบบเท่านั้น อย่าใช้ผลนี้ตัดสินอะไร
+    """
+    start_time = time.time()
+
+    entry = models.get("vocalip_sentence")
+    if entry is None:
+        raise HTTPException(
+            status_code=503,
+            detail="โมเดลประโยคยังไม่ถูกโหลด ตรวจสอบ server/models/vocalip_th_ctc/",
+        )
+    if not request.frames:
+        raise HTTPException(status_code=400, detail="ไม่มี frames ส่งมา")
+    if (request.frame_format or "rgb").lower() != "rgb":
+        raise HTTPException(status_code=400,
+                            detail="โมเดลประโยครับเฉพาะ frame_format='rgb'")
+
+    meta = entry["meta"]
+    roi = meta["roi"]
+    src_roi = int(request.roi or roi)
+
+    try:
+        frames = np.stack([
+            _decode_raw_rgb_frame(b, src_roi, roi, to_bgr=False)
+            for b in request.frames
+        ])
+        timeline = resample_to_fps(frames, request.capture_ms, meta["target_fps"])
+        text, tokens, blank_rate = predict_text(
+            entry["encoder"], entry["ctc"], entry["id_to_char"], meta, timeline)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+
+    capture_fps = (round(len(frames) / (request.capture_ms / 1000.0), 1)
+                   if request.capture_ms else None)
+
+    debug = DEBUG_DEFAULT if request.debug is None else bool(request.debug)
+    dbg = None
+    if debug:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        pick = frames[np.linspace(0, len(frames) - 1, min(len(frames), 24)).astype(int)]
+        strip_path = os.path.join(DEBUG_DIR, "sentence_frames_strip.png")
+        cv2.imwrite(strip_path, np.concatenate(list(pick), axis=1)[:, :, ::-1])
+        dbg = {"strip": strip_path, "token_ids": tokens}
+
+    elapsed = (time.time() - start_time) * 1000
+    print(f"📝 sentence: '{text}' | blank {blank_rate:.0%} | "
+          f"{len(frames)} frames @ {capture_fps} fps -> {len(timeline)} "
+          f"@ {meta['target_fps']:g} fps | {elapsed:.0f}ms", flush=True)
+
+    return SentencePredictResponse(
+        text=text,
+        token_count=len(tokens),
+        blank_rate=round(blank_rate, 4),
+        num_frames_received=len(frames),
+        num_frames_used=len(timeline),
+        capture_fps=capture_fps,
+        target_fps=meta["target_fps"],
+        processing_time_ms=round(elapsed, 2),
+        validation_cer=meta["validation_cer"],
+        debug=dbg,
+    )
 
 
 @app.get("/word_model_info")

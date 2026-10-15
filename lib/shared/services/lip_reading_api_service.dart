@@ -87,6 +87,46 @@ class LipReadingApiService {
     }
   }
 
+  /// โหมดทดลอง: อ่านปากเป็นข้อความอิสระด้วยโมเดลประโยค (CTC ระดับตัวอักษร)
+  ///
+  /// ส่ง "ทุกเฟรม" ที่เก็บได้ ไม่ต้องลดจำนวน และต้องส่ง [captureMs] มาเสมอ
+  /// เพราะ server ใช้ยืดเฟรมให้เป็น 25 fps ตามตอนเทรน ภาพต้องเป็น RGB ตามเดิม
+  static Future<SentencePrediction?> predictSentence(
+    List<Uint8List> frames, {
+    required int roiSize,
+    required int captureMs,
+  }) async {
+    if (frames.isEmpty) return null;
+
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$_baseUrl/predict_sentence'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'frames': frames.map(base64Encode).toList(),
+              'frame_format': 'rgb',
+              'roi': roiSize,
+              'capture_ms': captureMs,
+            }),
+          )
+          .timeout(_timeout);
+
+      if (response.statusCode != 200) {
+        debugPrint(
+            '❌ predict_sentence ${response.statusCode}: ${utf8.decode(response.bodyBytes)}');
+        return null;
+      }
+
+      final data =
+          jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
+      return SentencePrediction.fromJson(data);
+    } catch (e) {
+      debugPrint('❌ predict_sentence failed: $e');
+      return null;
+    }
+  }
+
   /// ถามค่า preprocessing ที่โมเดลบน server ต้องการจริงๆ
   ///
   /// ค่าพวกนี้ต้องตรงกับตอนเทรนเป๊ะ และเปลี่ยนได้ทุกครั้งที่เปลี่ยนไฟล์โมเดล
@@ -169,6 +209,45 @@ class WordModelConfig {
   @override
   String toString() => 'frames=$frames roi=$roi'
       '${mouthScale != null ? ' mouthScale=$mouthScale' : ''}';
+}
+
+/// ผลจากโมเดลประโยค (ทดลอง) — ไม่มีค่าความมั่นใจ จึงกรองผลมั่วไม่ได้
+class SentencePrediction {
+  final String text;
+
+  /// สัดส่วนเฟรมที่โมเดลตอบว่า "ไม่มีตัวอักษร" ใกล้ 100% แปลว่าแทบไม่ได้อะไร
+  final double blankRate;
+  final int framesReceived;
+
+  /// ความยาวที่โมเดลเห็นจริง หลัง server ยืดเฟรมเป็น 25 fps แล้ว
+  final int framesUsed;
+  final double? captureFps;
+  final double processingTimeMs;
+
+  const SentencePrediction({
+    required this.text,
+    required this.blankRate,
+    required this.framesReceived,
+    required this.framesUsed,
+    required this.captureFps,
+    required this.processingTimeMs,
+  });
+
+  factory SentencePrediction.fromJson(Map<String, dynamic> json) =>
+      SentencePrediction(
+        text: json['text'] as String? ?? '',
+        blankRate: (json['blank_rate'] as num?)?.toDouble() ?? 1.0,
+        framesReceived: (json['num_frames_received'] as num?)?.toInt() ?? 0,
+        framesUsed: (json['num_frames_used'] as num?)?.toInt() ?? 0,
+        captureFps: (json['capture_fps'] as num?)?.toDouble(),
+        processingTimeMs:
+            (json['processing_time_ms'] as num?)?.toDouble() ?? 0.0,
+      );
+
+  @override
+  String toString() => "'$text' blank ${(blankRate * 100).toStringAsFixed(1)}% "
+      '$framesReceived frames @ ${captureFps ?? '?'} fps -> $framesUsed '
+      '${processingTimeMs.toStringAsFixed(0)}ms';
 }
 
 /// คำที่โมเดลเดาได้หนึ่งตัวเลือก พร้อมความมั่นใจ
