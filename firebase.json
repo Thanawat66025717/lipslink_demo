@@ -1,0 +1,29 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "liplink-7a617",
+          "appId": "1:1068322775926:android:b82d3ac7caa424f4ea5057",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "liplink-7a617",
+          "configurations": {
+            "android": "1:1068322775926:android:b82d3ac7caa424f4ea5057",
+            "ios": "1:1068322775926:ios:225ed36ae6d0081cea5057",
+            "macos": "1:1068322775926:ios:225ed36ae6d0081cea5057",
+            "web": "1:1068322775926:web:0611d0024b4ca8f3ea5057",
+            "windows": "1:1068322775926:web:6851102b7071f322ea5057"
+          }
+        }
+      }
+    }
+  },
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  }
+}

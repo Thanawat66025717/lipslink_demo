@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:go_router/go_router.dart';
 import '../../../app/theme/app_theme.dart';
+import '../../../shared/services/phone_index_service.dart';
 import '../../../shared/widgets/gradient_button.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -44,14 +45,10 @@ class _LoginScreenState extends State<LoginScreen> {
       bool isPhoneNumber = RegExp(r'^[0-9]+$').hasMatch(loginId) && !loginId.contains('@');
 
       if (isPhoneNumber) {
-        // 2. ถ้าเป็นเบอร์โทร ให้วิ่งไปหาอีเมลใน Firestore
-        final querySnapshot = await FirebaseFirestore.instance
-            .collection('users')
-            .where('phone', isEqualTo: loginId) // ค้นหาจากฟิลด์ phone
-            .limit(1)
-            .get();
+        // 2. ถ้าเป็นเบอร์โทร ให้หาอีเมลจากตาราง phones (users อ่านได้เฉพาะเจ้าของ)
+        final email = await PhoneIndexService.emailFor(loginId);
 
-        if (querySnapshot.docs.isEmpty) {
+        if (email == null) {
           // ถ้าหาเบอร์นี้ไม่เจอในระบบ
           if (mounted) {
             setState(() {
@@ -62,15 +59,17 @@ class _LoginScreenState extends State<LoginScreen> {
           return;
         }
         
-        // 3. ถ้าเจอ ดึงอีเมลของเบอร์นั้นมาเตรียมล็อกอิน
-        emailForAuth = querySnapshot.docs.first.data()['email'] ?? '';
+        // 3. ถ้าเจอ ใช้อีเมลของเบอร์นั้นล็อกอิน
+        emailForAuth = email;
       }
 
       // 4. ทำการล็อกอินด้วย Firebase Auth (ใช้อีเมลที่แอบหามาได้ หรืออีเมลที่ผู้ใช้กรอกตรงๆ)
-      await FirebaseAuth.instance.signInWithEmailAndPassword(
+      final userCredential = await FirebaseAuth.instance.signInWithEmailAndPassword(
         email: emailForAuth,
         password: password,
       );
+      // บัญชีที่สมัครก่อนมีตาราง phones จะได้ล็อกอินด้วยเบอร์ได้ตั้งแต่ครั้งหน้า
+      await PhoneIndexService.ensureIndexed(userCredential.user!);
 
       if (mounted) {
         setState(() => _isLoading = false);

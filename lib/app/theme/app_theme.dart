@@ -8,6 +8,7 @@ class AppTheme {
   static const Color secondary = Color(0xFF7DCE9E); // Mint green from mockup
   static const Color accent = Color(0xFFBBE0FF);
   static const Color success = Color(0xFF7DCE9E);
+  static const Color successDark = Color(0xFF57A87A);
   static const Color warning = Color(0xFFFFB300);
   static const Color error = Color(0xFFEF5350);
 
@@ -22,17 +23,18 @@ class AppTheme {
   static const Color inputBg = Color(0xFFF2F4F7);
 
   // Gradients
+  //
+  // ทั้งสองตัวนี้เดิมเป็นสีเดียวกันซ้ำสองครั้ง (ดูเหมือน gradient แต่จริงๆ คือ
+  // สีทึบ) ปุ่มทุกปุ่มที่ใช้ตัวนี้เลยแบนราบไม่มีมิติความลึกเลย ตอนนี้ใช้สองโทน
+  // จริงของแต่ละสี (อ่อน -> เข้ม) ให้เห็นความลึกแบบผิวโค้งเบาๆ
   static const LinearGradient primaryGradient = LinearGradient(
-    colors: [
-      Color(0xFF6FB9F6),
-      Color(0xFF6FB9F6)
-    ], // Solid color basically, or slight gradient
+    colors: [primary, primaryDark],
     begin: Alignment.topLeft,
     end: Alignment.bottomRight,
   );
 
   static const LinearGradient successGradient = LinearGradient(
-    colors: [Color(0xFF7DCE9E), Color(0xFF7DCE9E)],
+    colors: [success, successDark],
     begin: Alignment.topLeft,
     end: Alignment.bottomRight,
   );

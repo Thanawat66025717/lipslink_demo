@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:go_router/go_router.dart';
 import '../../../app/theme/app_theme.dart';
+import '../../../shared/services/phone_index_service.dart';
 import '../../../shared/widgets/gradient_button.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -43,6 +44,18 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
     try {
       String email = _emailCtrl.text.trim();
+      String phone = _phoneCtrl.text.trim();
+
+      // เช็กก่อนสร้างบัญชี ไม่งั้นจะได้บัญชี Auth ค้างที่ผูกเบอร์ไม่ได้
+      if (await PhoneIndexService.isTakenByOther(phone, null)) {
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+            _errorMessage = 'เบอร์โทรศัพท์นี้มีผู้ใช้งานแล้ว';
+          });
+        }
+        return;
+      }
 
       // 1. สร้างบัญชีบน Firebase Auth
       UserCredential userCredential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
@@ -58,11 +71,12 @@ class _RegisterScreenState extends State<RegisterScreen> {
       await FirebaseFirestore.instance.collection('users').doc(userCredential.user!.uid).set({
         'email': email, 
         'name': fullName,
-        'phone': _phoneCtrl.text.trim(),
-        'dateOfBirth': null, 
+        'phone': phone,
+        'dateOfBirth': null,
         'profileImagePath': null,
-        'createdAt': FieldValue.serverTimestamp(), 
+        'createdAt': FieldValue.serverTimestamp(),
       });
+      await PhoneIndexService.claim(userCredential.user!.uid, email, phone);
 
       if (mounted) {
         setState(() => _isLoading = false);

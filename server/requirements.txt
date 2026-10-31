@@ -6,3 +6,6 @@ numpy
 opencv-python-headless
 Pillow
 python-multipart
+# VocaLip v4 — ต้องตรงเวอร์ชันตอนเทรน (mediapipe คนละเวอร์ชันให้จุดบนหน้าต่างกันเล็กน้อย)
+onnxruntime==1.31.0
+mediapipe==1.0.1

@@ -240,3 +240,192 @@ def load_model_2(model_path):
         itos = {str(k): v for k, v in itos.items()}
 
     return model, itos, config
+
+
+# ============================================================
+# VocaLip Thai — 44-word classifier (Notebook 03)
+# ============================================================
+#
+# โครงสร้างพอร์ตมาจาก Notebook 03 CELL 3 ตรงตัว ห้ามแก้ตัวเลขใดๆ
+# เพราะน้ำหนักที่เทรนมาผูกกับโครงสร้างนี้เป๊ะ ถ้าไม่ตรงจะโหลดไม่ผ่าน
+# (ตั้งใจใช้ strict=True เพื่อให้ error ทันทีแทนที่จะทำนายมั่วเงียบๆ)
+
+
+class VocaLipFrameCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(True), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(True), nn.MaxPool2d(2),
+            nn.Conv2d(64, 96, 3, padding=1, bias=False),
+            nn.BatchNorm2d(96), nn.ReLU(True), nn.MaxPool2d(2),
+            nn.Conv2d(96, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(True), nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.projection = nn.Sequential(
+            nn.Flatten(), nn.Linear(128, 128), nn.ReLU(True), nn.Dropout(0.10),
+        )
+
+    def forward(self, x):
+        return self.projection(self.features(x))
+
+
+class VocaLipAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(512, 128), nn.Tanh(), nn.Linear(128, 1),
+        )
+
+    def forward(self, x):
+        w = torch.softmax(self.attention(x).squeeze(-1), 1)
+        return (x * w.unsqueeze(-1)).sum(1), w
+
+
+class VocaLipEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.frame_encoder = VocaLipFrameCNN()
+        self.temporal_encoder = nn.GRU(
+            128, 256, 2, batch_first=True, bidirectional=True, dropout=0.20,
+        )
+        self.temporal_attention = VocaLipAttention()
+
+    def forward(self, x):
+        B, T, C, H, W = x.shape
+        f = self.frame_encoder(x.reshape(B * T, C, H, W)).reshape(B, T, -1)
+        h, _ = self.temporal_encoder(f)
+        return self.temporal_attention(h)[0]
+
+
+class VocaLipWordModel(nn.Module):
+    def __init__(self, num_classes=44):
+        super().__init__()
+        self.encoder = VocaLipEncoder()
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(512), nn.Dropout(0.2),
+            nn.Linear(512, 256), nn.ReLU(True), nn.Dropout(0.2),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        return self.classifier(self.encoder(x))
+
+
+def load_vocalip_word_model(model_path):
+    """โหลด deployment checkpoint ฟอร์แมต VocaLipThai-44Word-v1
+
+    คืน (model, id_to_word, meta) โดย meta รวม config/preprocessing/metrics
+    ที่ผู้เทรนบันทึกมาด้วย เพื่อให้ฝั่ง API ใช้ค่าจริงจาก checkpoint
+    แทนการ hardcode เอง
+    """
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+
+    fmt = checkpoint.get('format')
+    if fmt != 'VocaLipThai-44Word-v1':
+        raise ValueError(
+            f"ฟอร์แมต checkpoint ไม่ตรงที่รองรับ: {fmt!r} "
+            "(ต้องการ 'VocaLipThai-44Word-v1')"
+        )
+
+    config = checkpoint.get('model_config', {})
+    num_classes = int(config.get('classes', 44))
+
+    model = VocaLipWordModel(num_classes=num_classes)
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    model.eval()
+
+    # คีย์อาจเป็น int หรือ str แล้วแต่ตอนเซฟ ทำให้เป็น int ให้หมด
+    id_to_word = {
+        int(k): str(v) for k, v in checkpoint['id_to_word'].items()
+    }
+
+    meta = {
+        'format': fmt,
+        'config': config,
+        'preprocessing': checkpoint.get('preprocessing', {}),
+        'test_metrics': checkpoint.get('test_metrics', {}),
+        'scope': checkpoint.get('scope'),
+        'num_classes': num_classes,
+    }
+
+    return model, id_to_word, meta
+
+
+# ─── VocaLip 44 คำ รุ่น "real lipreading" (05_...) ────────────────────────────
+# ชิ้นส่วนข้างในเหมือนรุ่นก่อนทุกตัว (ชื่อและรูปร่าง tensor ตรงกันหมด) ต่างกันแค่
+# รุ่นก่อนห่อ frame_encoder/temporal_encoder/temporal_attention ไว้ใต้ .encoder
+# อีกชั้น ส่วนรุ่นนี้วางไว้ที่ระดับบนสุดเลย จึงใช้คลาสเดิมประกอบใหม่ได้
+
+class VocaLipRealModel(nn.Module):
+    def __init__(self, num_classes=44, gru_hidden=256, gru_layers=2,
+                 feature_dim=128, dropout=0.2):
+        super().__init__()
+        self.frame_encoder = VocaLipFrameCNN()
+        self.temporal_encoder = nn.GRU(
+            feature_dim, gru_hidden, gru_layers,
+            batch_first=True, bidirectional=True, dropout=dropout,
+        )
+        self.temporal_attention = VocaLipAttention()
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(gru_hidden * 2), nn.Dropout(dropout),
+            nn.Linear(gru_hidden * 2, 256), nn.ReLU(True), nn.Dropout(dropout),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        B, T, C, H, W = x.shape
+        f = self.frame_encoder(x.reshape(B * T, C, H, W)).reshape(B, T, -1)
+        h, _ = self.temporal_encoder(f)
+        pooled, _ = self.temporal_attention(h)
+        return self.classifier(pooled)
+
+
+def load_vocalip_real_model(model_path):
+    """โหลด checkpoint ฟอร์แมต VocaLip-44word-real-lipreading-v1
+
+    คืน (model, id_to_word, meta) โดยค่าทุกอย่างที่ deployment ต้องใช้ —
+    ลำดับช่องสี, จำนวนเฟรม, ขนาด ROI, เกณฑ์ปฏิเสธ, motion gate — อ่านจาก
+    checkpoint ทั้งหมด ไม่ hardcode ที่ฝั่ง server
+
+    โหลดแบบ strict=True เพื่อให้พังทันทีถ้าสถาปัตยกรรมไม่ตรง ดีกว่าโหลดผ่าน
+    แบบหลวมๆ แล้วได้โมเดลที่น้ำหนักบางส่วนเป็นค่าสุ่มโดยไม่มีอะไรฟ้อง
+    """
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+
+    fmt = checkpoint.get('format')
+    if fmt != 'VocaLip-44word-real-lipreading-v1':
+        raise ValueError(
+            f"ฟอร์แมต checkpoint ไม่ตรงที่รองรับ: {fmt!r} "
+            "(ต้องการ 'VocaLip-44word-real-lipreading-v1')"
+        )
+
+    config = checkpoint.get('model_config', {})
+    num_classes = int(config.get('num_classes', 44))
+
+    model = VocaLipRealModel(
+        num_classes=num_classes,
+        gru_hidden=int(config.get('gru_hidden', 256)),
+        gru_layers=int(config.get('gru_layers', 2)),
+        feature_dim=int(config.get('feature_dim', 128)),
+        dropout=float(config.get('dropout', 0.2)),
+    )
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    model.eval()
+
+    id_to_word = {int(k): str(v) for k, v in checkpoint['id_to_word'].items()}
+
+    meta = {
+        'format': fmt,
+        'config': config,
+        'preprocessing': checkpoint.get('preprocessing', {}),
+        'rejection': checkpoint.get('rejection', {}),
+        'motion_gate': checkpoint.get('motion_gate', {}),
+        'test_metrics': checkpoint.get('test_metrics', {}),
+        'scope': checkpoint.get('scope'),
+        'num_classes': num_classes,
+    }
+
+    return model, id_to_word, meta

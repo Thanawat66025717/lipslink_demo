@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1068322775926",
+    "project_id": "liplink-7a617",
+    "storage_bucket": "liplink-7a617.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1068322775926:android:b82d3ac7caa424f4ea5057",
+        "android_client_info": {
+          "package_name": "com.lipslink.lipslink"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAdSZGN0VFaMz7MCYCwc1gVf6mhOJ8N7lY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
