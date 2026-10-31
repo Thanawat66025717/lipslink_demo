@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../../app/theme/app_theme.dart';
+import '../../../shared/services/phone_index_service.dart';
 import '../../../shared/widgets/gradient_button.dart';
 
 class EditPhoneScreen extends StatefulWidget {
@@ -59,11 +60,20 @@ class _EditPhoneScreenState extends State<EditPhoneScreen> {
     try {
       final userAuth = FirebaseAuth.instance.currentUser;
       if (userAuth != null) {
-        await FirebaseFirestore.instance
-            .collection('users')
-            .doc(userAuth.uid)
-            .update({'phone': _ctrl.text.trim()});
-            
+        final newPhone = _ctrl.text.trim();
+        if (await PhoneIndexService.isTakenByOther(newPhone, userAuth.uid)) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('เบอร์โทรศัพท์นี้มีบัญชีอื่นใช้แล้ว'),
+                backgroundColor: AppTheme.error,
+              ),
+            );
+          }
+          return;
+        }
+        await PhoneIndexService.changePhone(userAuth, newPhone);
+
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(

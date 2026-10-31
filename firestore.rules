@@ -1,18 +1,40 @@
-rules_version='2'
+rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
-      // This rule allows anyone with your database reference to view, edit,
-      // and delete all data in your database. It is useful for getting
-      // started, but it is configured to expire after 30 days because it
-      // leaves your app open to attackers. At that time, all client
-      // requests to your database will be denied.
-      //
-      // Make sure to write security rules for your app before that time, or
-      // else all client requests to your database will be denied until you
-      // update your rules.
-      allow read, write: if request.time < timestamp.date(2026, 9, 20);
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // โปรไฟล์และประวัติ อ่าน/เขียนได้เฉพาะเจ้าของบัญชี
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+
+      match /history/{historyId} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    // เบอร์โทร → อีเมล สำหรับล็อกอินด้วยเบอร์ (ดู PhoneIndexService)
+    // ยังไม่ได้ล็อกอินก็ get ทีละเบอร์ได้ แต่ list ทั้งตารางไม่ได้
+    // จองเบอร์ได้ถ้ายังไม่มีใครใช้ และแก้/ลบได้เฉพาะ uid เจ้าของเบอร์
+    match /phones/{phone} {
+      allow get: if true;
+      allow list: if false;
+
+      allow create: if signedIn()
+        && phone.matches('^[0-9]{1,15}$')
+        && request.resource.data.keys().hasOnly(['uid', 'email'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email is string;
+
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid', 'email'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email is string;
+
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
     }
   }
 }
