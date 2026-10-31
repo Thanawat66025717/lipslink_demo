@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:go_router/go_router.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../../app/theme/app_theme.dart';
-import '../../../shared/services/storage_service.dart';
 import '../../../shared/widgets/gradient_button.dart';
 
 class EditNameScreen extends StatefulWidget {
@@ -19,27 +20,79 @@ class _EditNameScreenState extends State<EditNameScreen> {
   @override
   void initState() {
     super.initState();
-    StorageService.getCurrentUser().then((u) {
-      if (mounted && u != null) _ctrl.text = u.name;
-    });
+    _loadCurrentName();
+  }
+
+  // 🟢 ฟังก์ชันดึงชื่อเดิมจาก Firebase Firestore
+  Future<void> _loadCurrentName() async {
+    final userAuth = FirebaseAuth.instance.currentUser;
+    if (userAuth != null) {
+      try {
+        final doc = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(userAuth.uid)
+            .get();
+            
+        if (doc.exists && mounted) {
+          setState(() {
+            _ctrl.text = doc.data()?['name'] ?? '';
+          });
+        }
+      } catch (e) {
+        debugPrint('โหลดชื่อไม่สำเร็จ: $e');
+      }
+    }
   }
 
   @override
-  void dispose() { _ctrl.dispose(); super.dispose(); }
+  void dispose() { 
+    _ctrl.dispose(); 
+    super.dispose(); 
+  }
 
+  // 🟢 ฟังก์ชันอัปเดตชื่อขึ้น Firebase Firestore
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
+    
     setState(() => _isLoading = true);
-    final user = await StorageService.getCurrentUser();
-    if (user != null) {
-      await StorageService.updateUser(user.copyWith(name: _ctrl.text.trim()));
+    
+    try {
+      final userAuth = FirebaseAuth.instance.currentUser;
+      if (userAuth != null) {
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(userAuth.uid)
+            .update({'name': _ctrl.text.trim()});
+            
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('อัปเดตชื่อสำเร็จ! ✅'),
+              backgroundColor: Colors.green,
+            ),
+          );
+          context.pop(); // เปลี่ยนชื่อเสร็จแล้วให้กลับหน้าเดิม
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('เกิดข้อผิดพลาด: $e'),
+            backgroundColor: AppTheme.error,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
     }
-    if (mounted) { setState(() => _isLoading = false); context.pop(); }
   }
 
   @override
   Widget build(BuildContext context) => _EditScaffold(
-    title: 'RENAME',
+    title: 'แก้ไขชื่อ-สกุล', // เปลี่ยนชื่อ Title ให้อ่านง่ายขึ้น
     child: Form(
       key: _formKey,
       child: Column(
@@ -61,6 +114,11 @@ class _EditNameScreenState extends State<EditNameScreen> {
                     hintText: 'กรอกชื่อใหม่',
                     contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                     fillColor: AppTheme.inputBg,
+                    filled: true, // อย่าลืมใส่ filled: true เพื่อให้สีพื้นหลังทำงาน
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      borderSide: BorderSide.none,
+                    ),
                   ),
                   validator: (v) => (v?.isEmpty == true) ? '*' : null,
                 ),
@@ -75,7 +133,7 @@ class _EditNameScreenState extends State<EditNameScreen> {
                 label: 'ยืนยัน', 
                 isLoading: _isLoading, 
                 onPressed: _save,
-                isSecondary: true, // Use green button
+                // ลบ isSecondary ออกเพราะคุณอาจจะไม่ได้ตั้งค่ารับพารามิเตอร์นี้ใน GradientButton ของคุณ
               ).animate(delay: 100.ms).fadeIn(),
             ),
           ),

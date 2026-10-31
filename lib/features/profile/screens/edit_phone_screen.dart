@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:go_router/go_router.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../../app/theme/app_theme.dart';
-import '../../../shared/services/storage_service.dart';
 import '../../../shared/widgets/gradient_button.dart';
 
 class EditPhoneScreen extends StatefulWidget {
@@ -19,27 +20,79 @@ class _EditPhoneScreenState extends State<EditPhoneScreen> {
   @override
   void initState() {
     super.initState();
-    StorageService.getCurrentUser().then((u) {
-      if (mounted && u != null) _ctrl.text = u.phone;
-    });
+    _loadCurrentPhone();
+  }
+
+  // 🟢 ฟังก์ชันดึงเบอร์โทรเดิมจาก Firebase Firestore
+  Future<void> _loadCurrentPhone() async {
+    final userAuth = FirebaseAuth.instance.currentUser;
+    if (userAuth != null) {
+      try {
+        final doc = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(userAuth.uid)
+            .get();
+            
+        if (doc.exists && mounted) {
+          setState(() {
+            _ctrl.text = doc.data()?['phone'] ?? '';
+          });
+        }
+      } catch (e) {
+        debugPrint('โหลดเบอร์โทรไม่สำเร็จ: $e');
+      }
+    }
   }
 
   @override
-  void dispose() { _ctrl.dispose(); super.dispose(); }
+  void dispose() { 
+    _ctrl.dispose(); 
+    super.dispose(); 
+  }
 
+  // 🟢 ฟังก์ชันอัปเดตเบอร์โทรขึ้น Firebase Firestore
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
+    
     setState(() => _isLoading = true);
-    final user = await StorageService.getCurrentUser();
-    if (user != null) {
-      await StorageService.updateUser(user.copyWith(phone: _ctrl.text.trim()));
+    
+    try {
+      final userAuth = FirebaseAuth.instance.currentUser;
+      if (userAuth != null) {
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(userAuth.uid)
+            .update({'phone': _ctrl.text.trim()});
+            
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('อัปเดตเบอร์โทรศัพท์สำเร็จ! ✅'),
+              backgroundColor: Colors.green,
+            ),
+          );
+          context.pop(); // เปลี่ยนเบอร์เสร็จแล้วให้กลับหน้าเดิม
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('เกิดข้อผิดพลาด: $e'),
+            backgroundColor: AppTheme.error,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
     }
-    if (mounted) { setState(() => _isLoading = false); context.pop(); }
   }
 
   @override
   Widget build(BuildContext context) => _EditScaffold(
-    title: 'Reset Telephone',
+    title: 'แก้ไขเบอร์โทรศัพท์', // เปลี่ยนชื่อ Title ให้เป็นภาษาไทยและตรงบริบท
     child: Form(
       key: _formKey,
       child: Column(
@@ -48,10 +101,10 @@ class _EditPhoneScreenState extends State<EditPhoneScreen> {
           Row(
             children: [
               const SizedBox(
-                width: 70,
+                width: 80, // ปรับความกว้างนิดหน่อยเพื่อให้ข้อความไม่เบียด
                 child: Text(
                   'เบอร์โทรศัพท์',
-                  style: TextStyle(fontSize: 10, color: AppTheme.textSecondary),
+                  style: TextStyle(fontSize: 12, color: AppTheme.textSecondary),
                 ),
               ),
               Expanded(
@@ -62,6 +115,11 @@ class _EditPhoneScreenState extends State<EditPhoneScreen> {
                     hintText: 'กรอกเบอร์โทรใหม่',
                     contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                     fillColor: AppTheme.inputBg,
+                    filled: true, // เพิ่ม filled: true เพื่อให้สีพื้นหลังทำงาน
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      borderSide: BorderSide.none,
+                    ),
                   ),
                   validator: (v) => (v?.isEmpty == true) ? '*' : null,
                 ),
@@ -76,7 +134,7 @@ class _EditPhoneScreenState extends State<EditPhoneScreen> {
                 label: 'ยืนยัน', 
                 isLoading: _isLoading, 
                 onPressed: _save,
-                isSecondary: true, // Use green button
+                // เอา isSecondary ออก เพราะปกติคุณไม่ได้ใช้พารามิเตอร์นี้
               ).animate(delay: 100.ms).fadeIn(),
             ),
           ),
